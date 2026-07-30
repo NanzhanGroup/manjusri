@@ -1,0 +1,178 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://github.com/banshanhanfu/ws-lang/schema/instruction-set.schema.json",
+  "title": "WS Instruction Set",
+  "description": "Canonical schema for ws-lang instruction sets (YAML internal format)",
+  "type": "object",
+  "required": ["name", "steps"],
+  "properties": {
+    "task_id": {
+      "type": "string",
+      "description": "Unique task identifier, auto-generated: t-YYYYMMDD-NNN"
+    },
+    "name": {
+      "type": "string",
+      "description": "Human-readable task name"
+    },
+    "status": {
+      "type": "string",
+      "enum": ["pending", "running", "done", "fail"],
+      "description": "Task lifecycle status"
+    },
+    "created_at": {
+      "type": "string",
+      "format": "date-time",
+      "description": "Creation timestamp"
+    },
+    "tags": {
+      "type": "array",
+      "items": { "type": "string" },
+      "description": "Optional tags for categorization"
+    },
+    "environment": {
+      "type": "object",
+      "description": "Environment variables passed to all steps",
+      "additionalProperties": { "type": "string" }
+    },
+    "on_error": {
+      "$ref": "#/definitions/error_handling",
+      "description": "Global error handling policy"
+    },
+    "steps": {
+      "type": "array",
+      "description": "Ordered list of execution steps (DAG nodes)",
+      "items": { "$ref": "#/definitions/step" },
+      "minItems": 1
+    }
+  },
+  "definitions": {
+    "step": {
+      "type": "object",
+      "required": ["id", "name", "cap"],
+      "properties": {
+        "id": {
+          "type": "string",
+          "description": "Unique step identifier within this task"
+        },
+        "name": {
+          "type": "string",
+          "description": "Human-readable step name"
+        },
+        "cap": {
+          "type": "string",
+          "description": "Capability name, e.g. ws-voice, ws-image"
+        },
+        "input": {
+          "oneOf": [
+            { "$ref": "#/definitions/literal_input" },
+            { "$ref": "#/definitions/file_input" },
+            { "$ref": "#/definitions/ref_input" },
+            { "$ref": "#/definitions/merge_input" }
+          ],
+          "description": "Step input source"
+        },
+        "args": {
+          "type": "object",
+          "description": "Capability-specific arguments",
+          "additionalProperties": true
+        },
+        "outputs": {
+          "type": "array",
+          "items": { "$ref": "#/definitions/output_port" },
+          "description": "Named output ports exposed to downstream steps"
+        },
+        "on_error": {
+          "$ref": "#/definitions/error_handling",
+          "description": "Step-level error handling (overrides global)"
+        },
+        "depends_on": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "Step IDs this step depends on (auto-derived from ref inputs)"
+        },
+        "status": {
+          "type": "string",
+          "enum": ["pending", "running", "done", "fail", "skipped"],
+          "description": "Step execution status"
+        },
+        "timeout": {
+          "type": "integer",
+          "description": "Step execution timeout in seconds"
+        },
+        "result": {
+          "type": "object",
+          "description": "Execution result (populated after completion)"
+        },
+        "error": {
+          "type": "string",
+          "description": "Error message if step failed"
+        },
+        "started_at": { "type": "string", "format": "date-time" },
+        "completed_at": { "type": "string", "format": "date-time" }
+      }
+    },
+    "literal_input": {
+      "type": "object",
+      "required": ["type", "value"],
+      "properties": {
+        "type": { "type": "string", "const": "literal" },
+        "value": { "description": "Direct value passed to the step" }
+      }
+    },
+    "file_input": {
+      "type": "object",
+      "required": ["type", "path"],
+      "properties": {
+        "type": { "type": "string", "const": "file" },
+        "path": { "type": "string", "description": "File path" }
+      }
+    },
+    "ref_input": {
+      "type": "object",
+      "required": ["type", "from"],
+      "properties": {
+        "type": { "type": "string", "const": "ref" },
+        "from": { "type": "string", "description": "Source step ID" },
+        "output": { "type": "string", "description": "Output port name (default: 'default')" }
+      }
+    },
+    "merge_input": {
+      "type": "object",
+      "required": ["type", "sources"],
+      "properties": {
+        "type": { "type": "string", "const": "merge" },
+        "sources": {
+          "type": "array",
+          "items": { "$ref": "#/definitions/ref_input" }
+        }
+      }
+    },
+    "output_port": {
+      "type": "object",
+      "required": ["name", "from"],
+      "properties": {
+        "name": { "type": "string", "description": "Output port name" },
+        "from": { "type": "string", "description": "Source field: stdout.field or stderr.field" }
+      }
+    },
+    "error_handling": {
+      "type": "object",
+      "properties": {
+        "action": {
+          "type": "string",
+          "enum": ["stop", "retry", "ignore"],
+          "default": "stop"
+        },
+        "max_retries": { "type": "integer", "default": 3 },
+        "interval": { "type": "integer", "description": "Retry interval in seconds" },
+        "fallback": {
+          "type": "object",
+          "properties": {
+            "cap": { "type": "string" },
+            "args": { "type": "object" }
+          }
+        }
+      }
+    }
+  }
+}
