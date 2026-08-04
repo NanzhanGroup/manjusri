@@ -1390,15 +1390,9 @@ func (s *Server) handleBuildContext(w http.ResponseWriter, r *http.Request) {
 	s.db.QueryRow("SELECT COUNT(*) FROM session_threads WHERE session_id=? AND status='obsolete'", req.SessionID).Scan(&threadObsoleteCount)
 	s.mu.RUnlock()
 
-	// 4. 里程碑摘要：将已作废线程的摘要拼接到 system_prompt
-	if !req.IncludeObsolete {
-		s.mu.RLock()
-		milestonesText, _ := s.getObsoleteSummaries(req.SessionID)
-		s.mu.RUnlock()
-		if milestonesText != "" {
-			systemPrompt += "\n\n" + milestonesText
-		}
-	}
+	// 4. 已作废线程的摘要不再拼接到 system_prompt（2026-08-04 zxq）：
+	//    作废话题不应再出现在 LLM 上下文中，否则作废机制失去意义。
+	//    历史消息（第 5 步）也只加载 active 线程，作废线程的消息同样不进上下文。
 
 	// 5. 从 messages 表取最近 N 条消息
 	var historyText string
