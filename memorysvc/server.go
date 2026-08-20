@@ -63,7 +63,14 @@ func (s *Server) Start() error {
 	s.ensureMDFile("BASIC.MD")
 	s.ensureMDFile("SECURITY.MD")
 
-	// 删除旧的 socket 文件
+	// ── socket 文件处理（防"误删活实例 socket → 活实例变匿名监听"）──
+	// 先探测：路径可连接 → 仍有活实例在监听（flock 之外的冗余防线），拒绝启动；
+	// 连不上 → 说明是无人监听的僵尸文件（进程 SIGKILL 等场景残留），删除后重新监听。
+	if conn, err := net.DialTimeout("unix", s.socketPath, 300*time.Millisecond); err == nil {
+		conn.Close()
+		return fmt.Errorf("已有实例监听 %s，拒绝启动（防双实例）", s.socketPath)
+	}
+	// 删除僵尸 socket 文件（确认无活实例后才删，避免把活实例变成匿名监听）
 	os.Remove(s.socketPath)
 	os.MkdirAll(filepath.Dir(s.socketPath), 0755)
 
