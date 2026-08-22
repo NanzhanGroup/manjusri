@@ -131,6 +131,7 @@ func (s *Server) Start() error {
 	mux.HandleFunc("/threads/list", s.handleThreadList)
 	mux.HandleFunc("/threads/get", s.handleThreadGet)
 	mux.HandleFunc("/threads/reactivate", s.handleThreadReactivate)
+	mux.HandleFunc("/threads/purge", s.handleThreadPurge)
 	mux.HandleFunc("/discard-epoch", s.handleDiscardEpoch)
 	mux.HandleFunc("/discarded-msgids", s.handleDiscardedMsgIDs)
 
@@ -207,6 +208,38 @@ func (s *Server) initSchema() error {
 		discarded_at TEXT NOT NULL,
 		PRIMARY KEY (session_key, msg_id)
 	)`)
+	if err != nil {
+		return err
+	}
+	_, err = s.db.Exec(`CREATE INDEX IF NOT EXISTS idx_discarded_session ON discarded_messages(session_key)`)
+	if err != nil {
+		return err
+	}
+
+	// ── 归档消息表（长期生效：线程清理只删线程记录，消息归档于此，绝不物理删除）──
+	_, err = s.db.Exec(`CREATE TABLE IF NOT EXISTS archived_messages (
+		id INTEGER PRIMARY KEY,
+		session_id TEXT NOT NULL,
+		role TEXT NOT NULL DEFAULT 'user',
+		content TEXT NOT NULL,
+		created_at TEXT NOT NULL,
+		tokens INTEGER DEFAULT 0,
+		thread_id INTEGER DEFAULT NULL,
+		metadata TEXT DEFAULT '',
+		archived_at TEXT NOT NULL DEFAULT (datetime('now','localtime')),
+		archived_from TEXT DEFAULT 'thread_purge'
+	)`)
+	if err != nil {
+		return err
+	}
+	_, err = s.db.Exec(`CREATE INDEX IF NOT EXISTS idx_archived_session ON archived_messages(session_id)`)
+	if err != nil {
+		return err
+	}
+	_, err = s.db.Exec(`CREATE INDEX IF NOT EXISTS idx_archived_thread ON archived_messages(thread_id)`)
+	if err != nil {
+		return err
+	}
 	if err != nil {
 		return err
 	}

@@ -175,6 +175,43 @@ func (c *Client) ReactivateThread(sessionID string, threadID int64) error {
 	return nil
 }
 
+// PurgeThreadsResult 线程彻底清理结果
+type PurgeThreadsResult struct {
+	PurgedThreads    int `json:"purged_threads"`     // 删除的线程记录数
+	ArchivedMessages int `json:"archived_messages"`  // 归档到 archived_messages 的消息数
+	KeptMessages     int `json:"kept_messages"`      // messages 表中保留的消息数（不物理删除）
+}
+
+// PurgeThreads 彻底清理线程（长期生效规矩：只删线程记录，消息归档不物理删除）
+// threadIDs 为空时清理该 session 所有 obsolete 线程；只处理 obsolete，绝不误删 active
+func (c *Client) PurgeThreads(sessionID string, threadIDs ...int64) (*PurgeThreadsResult, error) {
+	body := map[string]interface{}{"session_id": sessionID}
+	if len(threadIDs) > 0 {
+		body["thread_ids"] = threadIDs
+	}
+	data, err := c.request("POST", "/threads/purge", body)
+	if err != nil {
+		return nil, err
+	}
+	var resp struct {
+		OK               bool `json:"ok"`
+		PurgedThreads    int  `json:"purged_threads"`
+		ArchivedMessages int  `json:"archived_messages"`
+		KeptMessages     int  `json:"kept_messages"`
+	}
+	if err := json.Unmarshal(data, &resp); err != nil {
+		return nil, fmt.Errorf("parse PurgeThreads response: %w", err)
+	}
+	if !resp.OK {
+		return nil, fmt.Errorf("purge threads failed")
+	}
+	return &PurgeThreadsResult{
+		PurgedThreads:    resp.PurgedThreads,
+		ArchivedMessages: resp.ArchivedMessages,
+		KeptMessages:     resp.KeptMessages,
+	}, nil
+}
+
 // DiscardEpoch POST /discard-epoch
 // 批量将消息标记为已作废（翻篇用）
 func (c *Client) DiscardEpoch(sessionKey string, msgIDs []string, epochID int) error {
