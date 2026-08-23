@@ -134,6 +134,14 @@ func (s *Server) Start() error {
 	mux.HandleFunc("/threads/purge", s.handleThreadPurge)
 	mux.HandleFunc("/discard-epoch", s.handleDiscardEpoch)
 	mux.HandleFunc("/discarded-msgids", s.handleDiscardedMsgIDs)
+	mux.HandleFunc("/tasks/create", s.handleTaskCreate)
+	mux.HandleFunc("/tasks/get", s.handleTaskGet)
+	mux.HandleFunc("/tasks/list", s.handleTaskList)
+	mux.HandleFunc("/tasks/update", s.handleTaskUpdate)
+	mux.HandleFunc("/tasks/checkpoint", s.handleTaskCheckpoint)
+	mux.HandleFunc("/tasks/finish", s.handleTaskFinish)
+	mux.HandleFunc("/tasks/active", s.handleTaskActive)
+
 
 	return http.Serve(listener, mux)
 }
@@ -275,6 +283,34 @@ func (s *Server) initSchema() error {
 		if err != nil && !strings.Contains(err.Error(), "duplicate column") {
 			return err
 		}
+	}
+
+	// ── 任务状态机（tasks） ──
+	_, err = s.db.Exec(`CREATE TABLE IF NOT EXISTS tasks (
+		id          INTEGER PRIMARY KEY AUTOINCREMENT,
+		task_id     TEXT NOT NULL UNIQUE,
+		session_id  TEXT NOT NULL,
+		user_id     TEXT DEFAULT '',
+		title       TEXT DEFAULT '',
+		status      TEXT NOT NULL DEFAULT 'pending',
+		steps       TEXT DEFAULT '[]',
+		current_step INTEGER DEFAULT 0,
+		current_step_name TEXT DEFAULT '',
+		summary     TEXT DEFAULT '',
+		created_at  TEXT NOT NULL DEFAULT (datetime('now','localtime')),
+		updated_at  TEXT NOT NULL DEFAULT (datetime('now','localtime')),
+		finished_at TEXT DEFAULT NULL
+	)`)
+	if err != nil {
+		return err
+	}
+	_, err = s.db.Exec(`CREATE INDEX IF NOT EXISTS idx_tasks_session ON tasks(session_id, status)`)
+	if err != nil {
+		return err
+	}
+	_, err = s.db.Exec(`CREATE INDEX IF NOT EXISTS idx_tasks_task_id ON tasks(task_id)`)
+	if err != nil {
+		return err
 	}
 
 	// 索引
