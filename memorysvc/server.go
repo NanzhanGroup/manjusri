@@ -96,7 +96,11 @@ func (s *Server) Start() error {
 	mux.HandleFunc("/search-layers", s.handleSearchLayers)
 	mux.HandleFunc("/search-all", s.handleSearchAll)
 	mux.HandleFunc("/search-by-tag", s.handleSearchByTag)
-	mux.HandleFunc("/count", s.handleCount)
+		mux.HandleFunc("/bind", s.handleBind)
+	mux.HandleFunc("/unbind", s.handleUnbind)
+	mux.HandleFunc("/resolve-session", s.handleResolveSession)
+	mux.HandleFunc("/list-bindings", s.handleListBindings)
+mux.HandleFunc("/count", s.handleCount)
 	mux.HandleFunc("/cleanup", s.handleCleanup)
 	mux.HandleFunc("/update-topic", s.handleUpdateTopic)
 	mux.HandleFunc("/basic", s.handleBasic)
@@ -309,6 +313,21 @@ func (s *Server) initSchema() error {
 		return err
 	}
 	_, err = s.db.Exec(`CREATE INDEX IF NOT EXISTS idx_tasks_task_id ON tasks(task_id)`)
+	if err != nil {
+		return err
+	}
+
+	// ── 跨平台用户绑定表（alias session → 主 session，实现跨平台记忆互通）──
+	_, err = s.db.Exec(`CREATE TABLE IF NOT EXISTS user_bindings (
+		alias_session   TEXT PRIMARY KEY,
+		primary_session TEXT NOT NULL,
+		bound_at        TEXT NOT NULL DEFAULT (datetime('now','localtime')),
+		note            TEXT DEFAULT ''
+	)`)
+	if err != nil {
+		return err
+	}
+	_, err = s.db.Exec(`CREATE INDEX IF NOT EXISTS idx_bindings_primary ON user_bindings(primary_session)`)
 	if err != nil {
 		return err
 	}

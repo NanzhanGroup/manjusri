@@ -127,3 +127,20 @@ type AppendMessageResult struct {
 	ObsoleteAction  string `json:"obsolete_action"`
 	ObsoleteReason  string `json:"obsolete_reason"`
 }
+
+// ── 跨平台用户绑定 ──
+
+// UserBinding 跨平台身份绑定：把 alias session（如 wecom_xxx）映射到主 session（如 weixin_xxx）
+// 绑定后 alias 平台的消息读写都落到主 session，实现跨平台记忆互通
+type UserBinding struct {
+	AliasSession   string `json:"alias_session"`   // 别名 session（发起绑定的一方）
+	PrimarySession string `json:"primary_session"` // 主 session（记忆归属方）
+	BoundAt        string `json:"bound_at"`
+	Note           string `json:"note"`
+}
+
+// ResolveResult 会话解析结果
+type ResolveResult struct {
+	Resolved string `json:"resolved"` // 解析后的 session_id（无绑定则原样返回）
+	Bound    bool   `json:"bound"`    // 是否命中绑定
+}
