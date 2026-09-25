@@ -188,34 +188,70 @@ func (c *Client) Upload(ctx context.Context, localPath, displayName string) (*Re
 	return nil, fmt.Errorf("文件投递失败（已尝试 %d 个站点）: %s", len(errs), strings.Join(errs, "; "))
 }
 
-// Delete 删除已投递文件（尽力而为的回收；失败只返回错误，不影响主流程）
+// Delete 删除已投递文件（尽力而为的回收；失败只返回错误，不影响主流程）。
+// 不知道文件落在哪一站时用它——依次问两个站点，只有真的删掉才算成功。
+// 已知站点（Result.Base）时优先用 DeleteAt，少一次无谓请求。
 func (c *Client) Delete(ctx context.Context, id string) error {
 	if !c.Enabled() || id == "" {
 		return ErrDisabled
 	}
 	var lastErr error
 	for _, base := range c.bases() {
-		req, err := http.NewRequestWithContext(ctx, http.MethodDelete, base+"/api/file/"+id, nil)
-		if err != nil {
-			return err
-		}
-		req.Header.Set(tokenHeader, c.token)
-		resp, err := c.hc.Do(req)
+		ok, err := c.deleteAt(ctx, base, id)
 		if err != nil {
 			lastErr = err
 			continue
 		}
-		body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
-		resp.Body.Close()
-		if resp.StatusCode/100 == 2 {
+		if ok {
 			return nil
 		}
-		lastErr = fmt.Errorf("HTTP %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
-		if resp.StatusCode != http.StatusNotFound {
-			break // 非「没有这个文件」的错误（如 401）换站也解决不了
-		}
 	}
-	return lastErr
+	if lastErr != nil {
+		return lastErr
+	}
+	return fmt.Errorf("未找到文件 %s（可能已过期回收）", id)
+}
+
+// DeleteAt 在**指定站点**删除（用投递时返回的 Result.Base，避免在另一站空跑）
+func (c *Client) DeleteAt(ctx context.Context, base, id string) error {
+	if !c.Enabled() || id == "" {
+		return ErrDisabled
+	}
+	base = strings.TrimRight(strings.TrimSpace(base), "/")
+	if base == "" {
+		return c.Delete(ctx, id)
+	}
+	ok, err := c.deleteAt(ctx, base, id)
+	if err != nil {
+		return err
+	}
+	if !ok {
+		return fmt.Errorf("站点 %s 未找到文件 %s（可能已过期回收）", base, id)
+	}
+	return nil
+}
+
+// deleteAt 在单站删除，返回「是否确实删除了一个文件」。
+// 注意：服务端对不存在的 id 也回 200（deleted=false），所以必须看 deleted 字段，
+// 不能只看状态码——否则「文件其实在另一站」时会被误判为回收成功。
+func (c *Client) deleteAt(ctx context.Context, base, id string) (bool, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodDelete, base+"/api/file/"+id, nil)
+	if err != nil {
+		return false, err
+	}
+	req.Header.Set(tokenHeader, c.token)
+	resp, err := c.hc.Do(req)
+	if err != nil {
+		return false, err
+	}
+	defer resp.Body.Close()
+	raw, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+	var r apiResp
+	_ = json.Unmarshal(raw, &r)
+	if resp.StatusCode/100 != 2 || !r.OK {
+		return false, fmt.Errorf("HTTP %d: %s", resp.StatusCode, firstNonEmpty(r.Error, strings.TrimSpace(string(raw))))
+	}
+	return r.Deleted, nil
 }
 
 // ---------- 单发 ----------
@@ -366,6 +402,7 @@ type apiResp struct {
 	UploadID  string `json:"upload_id"`
 	ChunkSize int64  `json:"chunk_size"`
 	Chunks    int    `json:"chunks"`
+	Deleted   bool   `json:"deleted"`
 }
 
 func (r apiResp) toResult(chunked bool) (*Result, error) {

@@ -30,6 +30,7 @@ type fakeFiles struct {
 	chunkHits  int
 	aborts     int
 	deleted    []string
+	knownIDs   map[string]bool   // 该站「确实存在」的文件 id（其余返回 deleted=false）
 	gotSHA     map[string]string // upload_id → 声明的 sha256
 	chunksRecv map[string]map[int]string
 }
@@ -37,6 +38,7 @@ type fakeFiles struct {
 func newFake() *fakeFiles {
 	return &fakeFiles{
 		infoChunk:  400000,
+		knownIDs:   map[string]bool{},
 		gotSHA:     map[string]string{},
 		chunksRecv: map[string]map[int]string{},
 	}
@@ -170,8 +172,16 @@ func (f *fakeFiles) handler() http.Handler {
 		writeJ(w, 200, map[string]any{"ok": true, "aborted": true})
 	})
 	mux.HandleFunc("/api/file/", func(w http.ResponseWriter, r *http.Request) {
+		id := strings.TrimPrefix(r.URL.Path, "/api/file/")
 		f.mu.Lock()
-		f.deleted = append(f.deleted, strings.TrimPrefix(r.URL.Path, "/api/file/"))
+		if f.knownIDs == nil || !f.knownIDs[id] {
+			// 服务端真实行为：文件不在此站 → 200 + deleted=false（不是 404）
+			f.mu.Unlock()
+			writeJ(w, 200, map[string]any{"ok": true, "deleted": false})
+			return
+		}
+		f.deleted = append(f.deleted, id)
+		delete(f.knownIDs, id) // 幂等：再删一次即 deleted=false
 		f.mu.Unlock()
 		writeJ(w, 200, map[string]any{"ok": true, "deleted": true})
 	})
@@ -380,11 +390,53 @@ func TestUploadRejects(t *testing.T) {
 // 回收：DELETE /api/file/{id}
 func TestDelete(t *testing.T) {
 	c, primary, _ := setupClient(t, "cn")
+	primary.knownIDs["abc123"] = true
 	if err := c.Delete(context.Background(), "abc123"); err != nil {
 		t.Fatal(err)
 	}
 	if len(primary.deleted) != 1 || primary.deleted[0] != "abc123" {
 		t.Fatalf("回收请求异常: %v", primary.deleted)
+	}
+}
+
+// 已投递在备站时，Delete（不知道站点）必须问到备站才算成功，不能因首站「200 + deleted=false」误判
+func TestDeleteFindsFileOnBackupSite(t *testing.T) {
+	c, primary, backup := setupClient(t, "cn")
+	backup.knownIDs["on-backup"] = true
+	if err := c.Delete(context.Background(), "on-backup"); err != nil {
+		t.Fatalf("应能在备站删到文件: %v", err)
+	}
+	if len(backup.deleted) != 1 {
+		t.Fatalf("备站应被删到: %v", backup.deleted)
+	}
+	if len(primary.deleted) != 0 {
+		t.Fatalf("首站不应误报删除: %v", primary.deleted)
+	}
+
+	// 两站都没有 → 返回错误（而不是静默成功）
+	if err := c.Delete(context.Background(), "nowhere"); err == nil {
+		t.Fatal("两站都没有该文件时应报错")
+	}
+}
+
+// DeleteAt 只问指定站点，避免空跑
+func TestDeleteAt(t *testing.T) {
+	c, primary, backup := setupClient(t, "cn")
+	backup.knownIDs["bb"] = true
+	ctx := context.Background()
+
+	if err := c.DeleteAt(ctx, backup.url, "bb"); err != nil {
+		t.Fatalf("指定备站删除应成功: %v", err)
+	}
+	if len(primary.deleted) != 0 {
+		t.Fatal("DeleteAt 不应请求其他站点")
+	}
+	if err := c.DeleteAt(ctx, backup.url, "nope"); err == nil {
+		t.Fatal("该站没有该文件应报错")
+	}
+	if err := c.DeleteAt(ctx, "", "bb"); err == nil {
+		// 空站点 ⇒ 退化为 Delete（此时 backup 已被删，两站都没有）
+		t.Fatal("空站点退化后仍应报错")
 	}
 }
 
