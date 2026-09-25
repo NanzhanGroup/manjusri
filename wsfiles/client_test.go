@@ -1,0 +1,417 @@
+package wsfiles
+
+import (
+	"context"
+	"crypto/sha256"
+	"encoding/base64"
+	"encoding/hex"
+	"encoding/json"
+	"fmt"
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"path/filepath"
+	"strings"
+	"sync"
+	"testing"
+)
+
+// fakeFiles 一个最小可用的 ws-files 假服务：单发 + init/chunk/complete/abort + delete。
+type fakeFiles struct {
+	mu        sync.Mutex
+	url       string // httptest 站点地址
+	infoChunk int64
+	// 强制失败次数（按 kind 计数），用于验证重试/故障转移
+	failSingle int
+	failChunk  int
+	singleHits int
+	initHits   int
+	chunkHits  int
+	aborts     int
+	deleted    []string
+	gotSHA     map[string]string // upload_id → 声明的 sha256
+	chunksRecv map[string]map[int]string
+}
+
+func newFake() *fakeFiles {
+	return &fakeFiles{
+		infoChunk:  400000,
+		gotSHA:     map[string]string{},
+		chunksRecv: map[string]map[int]string{},
+	}
+}
+
+func (f *fakeFiles) handler() http.Handler {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/api/info", func(w http.ResponseWriter, r *http.Request) {
+		writeJ(w, 200, map[string]any{"ok": true, "chunk_size": f.infoChunk, "single_shot_max_raw": SingleShotRawMax})
+	})
+	mux.HandleFunc("/api/upload", func(w http.ResponseWriter, r *http.Request) {
+		f.mu.Lock()
+		f.singleHits++
+		if f.failSingle > 0 {
+			f.failSingle--
+			f.mu.Unlock()
+			writeJ(w, 500, map[string]any{"ok": false, "error": "boom"})
+			return
+		}
+		f.mu.Unlock()
+		mr, err := r.MultipartReader()
+		if err != nil {
+			writeJ(w, 400, map[string]any{"ok": false, "error": "bad multipart"})
+			return
+		}
+		var name string
+		var size int
+		var ttl string
+		for {
+			p, err := mr.NextPart()
+			if err == io.EOF {
+				break
+			}
+			if err != nil {
+				writeJ(w, 400, map[string]any{"ok": false, "error": err.Error()})
+				return
+			}
+			switch p.FormName() {
+			case "file":
+				name = p.FileName()
+				b, _ := io.ReadAll(p)
+				size = len(b)
+			case "ttl_min":
+				b, _ := io.ReadAll(p)
+				ttl = string(b)
+			}
+		}
+		if name == "" || size == 0 {
+			writeJ(w, 400, map[string]any{"ok": false, "error": "缺少文件字段（file）"})
+			return
+		}
+		writeJ(w, 200, map[string]any{
+			"ok": true, "url": "https://cn.dl.xiusoft.cn/f/20260926/abc123/" + name,
+			"id": "abc123", "name": name, "size": size, "sha256": "x", "expires_at": 1, "ttl_min": ttl,
+		})
+	})
+	mux.HandleFunc("/api/upload/init", func(w http.ResponseWriter, r *http.Request) {
+		var req struct {
+			Filename string `json:"filename"`
+			Size     int64  `json:"size"`
+			SHA256   string `json:"sha256"`
+			Chunks   int    `json:"chunks"`
+		}
+		body, _ := io.ReadAll(r.Body)
+		_ = json.Unmarshal(body, &req)
+		f.mu.Lock()
+		f.initHits++
+		id := fmt.Sprintf("up%d", f.initHits)
+		f.gotSHA[id] = req.SHA256
+		f.chunksRecv[id] = map[int]string{}
+		f.mu.Unlock()
+		writeJ(w, 200, map[string]any{
+			"ok": true, "upload_id": id, "chunk_size": f.infoChunk,
+			"chunks": req.Chunks, "name": req.Filename, "size": req.Size,
+		})
+	})
+	mux.HandleFunc("/api/upload/chunk", func(w http.ResponseWriter, r *http.Request) {
+		var req struct {
+			UploadID string `json:"upload_id"`
+			Idx      int    `json:"idx"`
+			Data     string `json:"data"`
+		}
+		body, _ := io.ReadAll(r.Body)
+		_ = json.Unmarshal(body, &req)
+		f.mu.Lock()
+		if f.failChunk > 0 {
+			f.failChunk--
+			f.mu.Unlock()
+			writeJ(w, http.StatusTooManyRequests, map[string]any{"ok": false, "error": "限流"})
+			return
+		}
+		f.chunkHits++
+		if seg, err := base64.StdEncoding.DecodeString(req.Data); err == nil {
+			f.chunksRecv[req.UploadID][req.Idx] = hex.EncodeToString(seg)
+		}
+		f.mu.Unlock()
+		writeJ(w, 200, map[string]any{"ok": true, "received": req.Idx + 1})
+	})
+	mux.HandleFunc("/api/upload/complete", func(w http.ResponseWriter, r *http.Request) {
+		var req struct {
+			UploadID string `json:"upload_id"`
+		}
+		body, _ := io.ReadAll(r.Body)
+		_ = json.Unmarshal(body, &req)
+		f.mu.Lock()
+		var h = sha256.New()
+		for i := 0; ; i++ {
+			seg, ok := f.chunksRecv[req.UploadID][i]
+			if !ok {
+				break
+			}
+			b, _ := hex.DecodeString(seg)
+			h.Write(b)
+		}
+		got := hex.EncodeToString(h.Sum(nil))
+		want := f.gotSHA[req.UploadID]
+		f.mu.Unlock()
+		if got != want {
+			writeJ(w, 400, map[string]any{"ok": false, "error": "sha256 校验不符"})
+			return
+		}
+		writeJ(w, 200, map[string]any{
+			"ok": true, "url": "https://cn.dl.xiusoft.cn/f/20260926/big999/big.bin",
+			"id": "big999", "name": "big.bin", "size": 800000, "sha256": got, "expires_at": 1,
+		})
+	})
+	mux.HandleFunc("/api/upload/abort", func(w http.ResponseWriter, r *http.Request) {
+		f.mu.Lock()
+		f.aborts++
+		f.mu.Unlock()
+		writeJ(w, 200, map[string]any{"ok": true, "aborted": true})
+	})
+	mux.HandleFunc("/api/file/", func(w http.ResponseWriter, r *http.Request) {
+		f.mu.Lock()
+		f.deleted = append(f.deleted, strings.TrimPrefix(r.URL.Path, "/api/file/"))
+		f.mu.Unlock()
+		writeJ(w, 200, map[string]any{"ok": true, "deleted": true})
+	})
+	return mux
+}
+
+func writeJ(w http.ResponseWriter, code int, v any) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(code)
+	_ = json.NewEncoder(w).Encode(v)
+}
+
+// setupClient 起两个假站点（主/备）并返回客户端与两个 fake
+func setupClient(t *testing.T, defRegion string) (*Client, *fakeFiles, *fakeFiles) {
+	t.Helper()
+	primary, backup := newFake(), newFake()
+	s1 := httptest.NewServer(primary.handler())
+	s2 := httptest.NewServer(backup.handler())
+	t.Cleanup(s1.Close)
+	t.Cleanup(s2.Close)
+	primary.url, backup.url = s1.URL, s2.URL
+
+	t.Setenv("WS_FILES_TOKEN", "test-token")
+	t.Setenv("WS_FILES_TIMEOUT", "10")
+	t.Setenv("WS_FILES_TTL_MIN", "60")
+	if defRegion == "hk" {
+		t.Setenv("WS_FILES_BASE_HK", s1.URL)
+		t.Setenv("WS_FILES_BASE_CN", s2.URL)
+	} else {
+		t.Setenv("WS_FILES_BASE_CN", s1.URL)
+		t.Setenv("WS_FILES_BASE_HK", s2.URL)
+	}
+	t.Setenv("WS_FILES_REGION", "")
+	return New(defRegion), primary, backup
+}
+
+func writeTemp(t *testing.T, name string, size int) string {
+	t.Helper()
+	dir := t.TempDir()
+	p := filepath.Join(dir, name)
+	buf := make([]byte, size)
+	for i := range buf {
+		buf[i] = byte(i % 251)
+	}
+	if err := os.WriteFile(p, buf, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	return p
+}
+
+// 未配置令牌 ⇒ 禁用（SECURITY/P0：调用方据此降级，不做无意义的网络请求）
+func TestDisabledWithoutToken(t *testing.T) {
+	t.Setenv("WS_FILES_TOKEN", "")
+	c := New("cn")
+	if c.Enabled() {
+		t.Fatal("无令牌时应为禁用")
+	}
+	if _, err := c.Upload(context.Background(), "/etc/hosts", "hosts"); err != ErrDisabled {
+		t.Fatalf("应返回 ErrDisabled，实际 %v", err)
+	}
+}
+
+// 小文件走单发，文件名/ttl 正确送达
+func TestUploadSingleShot(t *testing.T) {
+	c, primary, _ := setupClient(t, "cn")
+	if !c.Enabled() {
+		t.Fatal("应启用")
+	}
+	p := writeTemp(t, "小 图.png", 1000)
+	res, err := c.Upload(context.Background(), p, "小 图.png")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(res.URL, "/f/") || res.ID == "" {
+		t.Fatalf("URL/ID 异常: %+v", res)
+	}
+	if res.Chunked {
+		t.Fatal("小文件不应走分块")
+	}
+	if res.Base != primary.url {
+		t.Fatalf("Base 应为实际站点 %s，实际 %s", primary.url, res.Base)
+	}
+	if primary.singleHits != 1 {
+		t.Fatalf("单发应恰好 1 次，实际 %d", primary.singleHits)
+	}
+}
+
+// 大文件自动走分块，且服务端按整份 sha256 校验通过
+func TestUploadChunked(t *testing.T) {
+	c, primary, _ := setupClient(t, "cn")
+	size := SingleShotRawMax + 1000 // 800048 B
+	p := writeTemp(t, "big.bin", size)
+	res, err := c.Upload(context.Background(), p, "big.bin")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !res.Chunked {
+		t.Fatal("大文件应走分块")
+	}
+	want := 2 // ceil(800048 / 400000)
+	if primary.chunkHits != want {
+		t.Fatalf("分块数应为 %d，实际 %d", want, primary.chunkHits)
+	}
+	if primary.singleHits != 0 {
+		t.Fatal("大文件不应走单发")
+	}
+	if res.SHA256 == "" {
+		t.Fatal("complete 应回 sha256")
+	}
+}
+
+// region=hk ⇒ 优先 hk 站点；region=cn ⇒ 优先 cn 站点
+func TestRegionPreference(t *testing.T) {
+	c, s1, s2 := setupClient(t, "hk")
+	if _, err := c.Upload(context.Background(), writeTemp(t, "a.txt", 10), "a.txt"); err != nil {
+		t.Fatal(err)
+	}
+	if s1.singleHits != 1 || s2.singleHits != 0 {
+		t.Fatalf("hk 优先应命中 hk：hk=%d cn=%d", s1.singleHits, s2.singleHits)
+	}
+
+	c2, s1b, s2b := setupClient(t, "cn")
+	if _, err := c2.Upload(context.Background(), writeTemp(t, "b.txt", 10), "b.txt"); err != nil {
+		t.Fatal(err)
+	}
+	if s1b.singleHits != 1 || s2b.singleHits != 0 {
+		t.Fatalf("cn 优先应命中 cn：cn=%d hk=%d", s1b.singleHits, s2b.singleHits)
+	}
+}
+
+// WS_FILES_REGION 显式设置时覆盖 defaultRegion
+func TestRegionEnvOverride(t *testing.T) {
+	c, _, hkStation := setupClient(t, "cn") // defRegion=cn ⇒ s1=cn、s2=hk
+	t.Setenv("WS_FILES_REGION", "hk")
+	c = New("cn")
+	if got := c.PrimaryBase(); got != hkStation.url {
+		t.Fatalf("WS_FILES_REGION=hk 应优先 hk 站点，实际 %s（期望 %s）", got, hkStation.url)
+	}
+}
+
+// 首选站点 500 ⇒ 自动转移到备站，结果仍成功
+func TestFailoverToBackup(t *testing.T) {
+	c, primary, backup := setupClient(t, "cn")
+	primary.failSingle = 1
+	res, err := c.Upload(context.Background(), writeTemp(t, "f.bin", 100), "f.bin")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if backup.singleHits != 1 {
+		t.Fatalf("应转移到备站，备站命中 %d", backup.singleHits)
+	}
+	if res.Base != c.bases()[1] {
+		t.Fatalf("Base 应为备站，实际 %s", res.Base)
+	}
+}
+
+// 429 限流 ⇒ 退避后重试成功（不转移站点、不损坏内容）
+func TestRetryOn429(t *testing.T) {
+	c, primary, backup := setupClient(t, "cn")
+	primary.failChunk = 1 // 第一块限流
+	p := writeTemp(t, "big.bin", SingleShotRawMax+100)
+	res, err := c.Upload(context.Background(), p, "big.bin")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Base == "" || backup.chunkHits != 0 {
+		t.Fatal("限流应在同站重试成功，不应转移站点")
+	}
+	if primary.chunkHits != 2 {
+		t.Fatalf("重试后应成功上传 2 块，实际 %d", primary.chunkHits)
+	}
+}
+
+// 两站都失败 ⇒ 报错信息含两个站点
+func TestBothBasesFail(t *testing.T) {
+	c, primary, backup := setupClient(t, "cn")
+	primary.failSingle, backup.failSingle = 1, 1
+	_, err := c.Upload(context.Background(), writeTemp(t, "x.bin", 10), "x.bin")
+	if err == nil {
+		t.Fatal("应报错")
+	}
+	if !strings.Contains(err.Error(), "已尝试 2 个站点") {
+		t.Fatalf("错误应说明尝试了两个站点: %v", err)
+	}
+}
+
+// 目录/空文件/超限一律拒绝
+func TestUploadRejects(t *testing.T) {
+	c, _, _ := setupClient(t, "cn")
+	ctx := context.Background()
+	if _, err := c.Upload(ctx, t.TempDir(), "d"); err == nil {
+		t.Fatal("目录应被拒")
+	}
+	empty := filepath.Join(t.TempDir(), "e.txt")
+	if err := os.WriteFile(empty, nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := c.Upload(ctx, empty, "e.txt"); err == nil {
+		t.Fatal("空文件应被拒")
+	}
+	if _, err := c.Upload(ctx, filepath.Join(t.TempDir(), "nope"), "n"); err == nil {
+		t.Fatal("不存在的文件应被拒")
+	}
+}
+
+// 回收：DELETE /api/file/{id}
+func TestDelete(t *testing.T) {
+	c, primary, _ := setupClient(t, "cn")
+	if err := c.Delete(context.Background(), "abc123"); err != nil {
+		t.Fatal(err)
+	}
+	if len(primary.deleted) != 1 || primary.deleted[0] != "abc123" {
+		t.Fatalf("回收请求异常: %v", primary.deleted)
+	}
+}
+
+// 文件名清洗：去目录、去控制字符、限长
+func TestSanitizeName(t *testing.T) {
+	cases := map[string]string{
+		"../../etc/passwd": "passwd",
+		"a/b/c.png":        "c.png",
+		"ok-name_1.txt":    "ok-name_1.txt",
+		"含 中文 名.png":       "含 中文 名.png",
+		"  .hidden  ":      "hidden",
+	}
+	for in, want := range cases {
+		if got := sanitizeName(in); got != want {
+			t.Errorf("sanitizeName(%q) = %q，期望 %q", in, got, want)
+		}
+	}
+	if got := sanitizeName("x"); got != "x" {
+		t.Errorf("普通名不应被改动: %q", got)
+	}
+	if len([]rune(sanitizeName(strings.Repeat("长", 300)))) > 100 {
+		t.Error("长名应被截断到 100 字符")
+	}
+}
+
+func (f *fakeFiles) counts() (single, chunk, init int) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.singleHits, f.chunkHits, f.initHits
+}
