@@ -43,12 +43,16 @@ func TestTokenNeverReadFromFile(t *testing.T) {
 	t.Setenv("WS_FILES_TOKEN", "")
 	t.Setenv("WS_FILES_REGION", "cn")
 
-	if c := New("cn"); c.Enabled() {
+	c := New("cn")
+	if c.token != "" {
 		t.Fatal("令牌不得从 $WS_PATH/.env 读取（SECURITY/P0）")
 	}
+	if !c.Anonymous() {
+		t.Fatal("无令牌时应走匿名模式（而非被 .env 里的假令牌启用）")
+	}
 	t.Setenv("WS_FILES_TOKEN", "from-env")
-	if c := New("cn"); !c.Enabled() {
-		t.Fatal("进程环境提供令牌时应启用")
+	if c := New("cn"); !c.Enabled() || c.Anonymous() {
+		t.Fatal("进程环境提供令牌时应启用，且不再是匿名模式")
 	}
 }
 

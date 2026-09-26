@@ -15,13 +15,18 @@
 //
 // 配置全部走环境变量（SECURITY/P0：令牌只注入环境，不落盘、不进代码）：
 //
-//	WS_FILES_TOKEN    写操作令牌；为空 ⇒ Enabled()=false，调用方应跳过或降级
+//	WS_FILES_TOKEN    写操作令牌；**可选**——留空即匿名模式（默认允许）
 //	                  （**只从进程环境读**，SECURITY/P0：密钥不落盘、不进代码）
+//	WS_FILES_ANON     =0 强制要求令牌（无令牌时 Enabled()=false，调用方跳过/降级）；
+//	                  默认（未设或 =1）允许匿名：无令牌也照常投递
 //	WS_FILES_REGION   cn | hk | auto，默认 auto（按 New 传入的 defaultRegion，另一站兜底）
 //	WS_FILES_BASE_CN  默认 https://cn.dl.xiusoft.cn
 //	WS_FILES_BASE_HK  默认 https://hk.dl.xiusoft.cn
 //	WS_FILES_TTL_MIN  保留分钟数，默认 1440（24h，服务端上限 10080）
 //	WS_FILES_TIMEOUT  单请求超时秒数，默认 60
+//
+// 令牌与服务端的关系：服务端默认 fail-closed（未配令牌则拒绝写操作），
+// 需以 --allow-anonymous / WS_FILES_ANON=1 显式开启匿名接收；两端都不配即「零配置可用」。
 //
 // 除令牌外的配置项读取顺序：进程环境 > /etc/environment > $WS_PATH/.env。
 package wsfiles
@@ -64,8 +69,8 @@ const (
 	tokenHeader = "X-WS-Files-Token"
 )
 
-// ErrDisabled 未配置令牌（Enabled()=false）
-var ErrDisabled = errors.New("未配置 WS_FILES_TOKEN，文殊文件服务不可用")
+// ErrDisabled 服务被显式关闭（未配令牌且 WS_FILES_ANON=0）
+var ErrDisabled = errors.New("文殊文件服务未启用（未配置 WS_FILES_TOKEN 且 WS_FILES_ANON=0）")
 
 // Result 一次投递的结果
 type Result struct {
@@ -82,6 +87,7 @@ type Result struct {
 // Client 文件服务客户端（并发安全：内部无可变共享状态，除 chunkSize 缓存外）
 type Client struct {
 	token  string
+	anon   bool // 允许匿名（无令牌）投递；WS_FILES_ANON=0 时为 false
 	baseCN string
 	baseHK string
 	region string // 强制区域（cn/hk），空则按 defaultRegion
@@ -96,6 +102,7 @@ type Client struct {
 func New(defaultRegion string) *Client {
 	c := &Client{
 		token:  strings.TrimSpace(os.Getenv("WS_FILES_TOKEN")),
+		anon:   anonAllowed(),
 		baseCN: envStr("WS_FILES_BASE_CN", DefaultBaseCN),
 		baseHK: envStr("WS_FILES_BASE_HK", DefaultBaseHK),
 		region: strings.ToLower(configValue("WS_FILES_REGION")),
@@ -111,8 +118,32 @@ func New(defaultRegion string) *Client {
 	return c
 }
 
-// Enabled 是否可用（有令牌）
-func (c *Client) Enabled() bool { return c != nil && c.token != "" }
+// anonAllowed 是否允许匿名投递：默认允许；WS_FILES_ANON=0/false 时强制要求令牌。
+func anonAllowed() bool {
+	v := strings.TrimSpace(configValue("WS_FILES_ANON"))
+	if v == "" {
+		return true // 默认：零配置可用（无需到处配令牌）
+	}
+	return v != "0" && !strings.EqualFold(v, "false") && !strings.EqualFold(v, "no")
+}
+
+// Enabled 是否可用：有令牌 ⇒ 用令牌；无令牌 ⇒ 匿名模式（默认允许，WS_FILES_ANON=0 可强制关闭）。
+func (c *Client) Enabled() bool {
+	if c == nil {
+		return false
+	}
+	return c.token != "" || c.anon
+}
+
+// Anonymous 是否以匿名（无令牌）方式投递 —— 供日志/自检展示。
+func (c *Client) Anonymous() bool { return c != nil && c.token == "" && c.anon }
+
+// setAuth 附加鉴权头：仅在配置了令牌时发送（匿名模式下不带该头，服务端也不校验）。
+func (c *Client) setAuth(req *http.Request) {
+	if c.token != "" {
+		req.Header.Set(tokenHeader, c.token)
+	}
+}
 
 // TTLMin 返回生效的保留分钟数
 func (c *Client) TTLMin() int {
@@ -239,7 +270,7 @@ func (c *Client) deleteAt(ctx context.Context, base, id string) (bool, error) {
 	if err != nil {
 		return false, err
 	}
-	req.Header.Set(tokenHeader, c.token)
+	c.setAuth(req)
 	resp, err := c.hc.Do(req)
 	if err != nil {
 		return false, err
@@ -249,7 +280,8 @@ func (c *Client) deleteAt(ctx context.Context, base, id string) (bool, error) {
 	var r apiResp
 	_ = json.Unmarshal(raw, &r)
 	if resp.StatusCode/100 != 2 || !r.OK {
-		return false, fmt.Errorf("HTTP %d: %s", resp.StatusCode, firstNonEmpty(r.Error, strings.TrimSpace(string(raw))))
+		return false, fmt.Errorf("HTTP %d: %s", resp.StatusCode,
+			authErrHint(resp.StatusCode, firstNonEmpty(r.Error, strings.TrimSpace(string(raw)))))
 	}
 	return r.Deleted, nil
 }
@@ -282,7 +314,7 @@ func (c *Client) uploadSingle(ctx context.Context, base, path, name string) (*Re
 		return nil, err
 	}
 	req.Header.Set("Content-Type", mw.FormDataContentType())
-	req.Header.Set(tokenHeader, c.token)
+	c.setAuth(req)
 
 	resp, err := c.hc.Do(req)
 	if err != nil {
@@ -293,7 +325,8 @@ func (c *Client) uploadSingle(ctx context.Context, base, path, name string) (*Re
 	var r apiResp
 	_ = json.Unmarshal(raw, &r)
 	if resp.StatusCode/100 != 2 || !r.OK {
-		return nil, fmt.Errorf("单发上传失败 HTTP %d: %s", resp.StatusCode, firstNonEmpty(r.Error, strings.TrimSpace(string(raw))))
+		return nil, fmt.Errorf("单发上传失败 HTTP %d: %s", resp.StatusCode,
+			authErrHint(resp.StatusCode, firstNonEmpty(r.Error, strings.TrimSpace(string(raw)))))
 	}
 	return r.toResult(false)
 }
@@ -437,7 +470,7 @@ func (c *Client) postJSON(ctx context.Context, url string, payload any, out *api
 			return err
 		}
 		req.Header.Set("Content-Type", "application/json")
-		req.Header.Set(tokenHeader, c.token)
+		c.setAuth(req)
 
 		resp, err := c.hc.Do(req)
 		if err != nil {
@@ -453,7 +486,8 @@ func (c *Client) postJSON(ctx context.Context, url string, payload any, out *api
 			*out = r
 			return nil
 		}
-		lastErr = fmt.Errorf("HTTP %d: %s", resp.StatusCode, firstNonEmpty(r.Error, strings.TrimSpace(string(raw))))
+		lastErr = fmt.Errorf("HTTP %d: %s", resp.StatusCode,
+			authErrHint(resp.StatusCode, firstNonEmpty(r.Error, strings.TrimSpace(string(raw)))))
 		// 429（限流）与 5xx 可重试；4xx 其余（鉴权/参数/超限）重试无意义
 		if resp.StatusCode != http.StatusTooManyRequests && resp.StatusCode/100 != 5 {
 			break
@@ -463,6 +497,17 @@ func (c *Client) postJSON(ctx context.Context, url string, payload any, out *api
 }
 
 // ---------- 工具 ----------
+
+// authErrHint 给 401 补上可操作的排障提示。
+// 401 在「两端令牌口径不一致」时最容易出现：客户端没带令牌而服务端没开匿名，
+// 或客户端带了令牌而服务端配的是另一个。直接照原样抛出去，排障要绕一大圈。
+func authErrHint(status int, msg string) string {
+	if status != http.StatusUnauthorized {
+		return msg
+	}
+	return msg + "（服务端拒绝写操作：它可能仍要求令牌、或未开启匿名接收。请让服务端以" +
+		"--allow-anonymous / WS_FILES_ANON=1 启动，或在本机配置 WS_FILES_TOKEN）"
+}
 
 // sha256File 计算整份文件摘要（init 时上报，complete 时服务端校验）
 func sha256File(path string) (string, error) {

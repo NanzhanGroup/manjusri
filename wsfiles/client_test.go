@@ -33,6 +33,10 @@ type fakeFiles struct {
 	knownIDs   map[string]bool   // 该站「确实存在」的文件 id（其余返回 deleted=false）
 	gotSHA     map[string]string // upload_id → 声明的 sha256
 	chunksRecv map[string]map[int]string
+
+	// 鉴权口径（默认「匿名接收」：不校验令牌，与开启 --allow-anonymous 的服务端一致）
+	requireToken bool     // true ⇒ 模拟未开匿名的服务端（fail-closed）
+	seenTokens   []string // 每个请求实际带到的令牌头（验证「匿名不发头」）
 }
 
 func newFake() *fakeFiles {
@@ -185,7 +189,22 @@ func (f *fakeFiles) handler() http.Handler {
 		f.mu.Unlock()
 		writeJ(w, 200, map[string]any{"ok": true, "deleted": true})
 	})
-	return mux
+	return f.serve(mux)
+}
+
+// serve 统一入口：记录令牌头（验证「匿名模式不带令牌头」），并按 requireToken 模拟鉴权
+func (f *fakeFiles) serve(mux *http.ServeMux) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		f.mu.Lock()
+		f.seenTokens = append(f.seenTokens, r.Header.Get(tokenHeader))
+		need := f.requireToken
+		f.mu.Unlock()
+		if need && r.Header.Get(tokenHeader) == "" {
+			writeJ(w, 401, map[string]any{"ok": false, "error": "令牌无效或缺失"})
+			return
+		}
+		mux.ServeHTTP(w, r)
+	})
 }
 
 func writeJ(w http.ResponseWriter, code int, v any) {
@@ -218,6 +237,31 @@ func setupClient(t *testing.T, defRegion string) (*Client, *fakeFiles, *fakeFile
 	return New(defRegion), primary, backup
 }
 
+// setupClientNoToken 同 setupClient，但**不配令牌**（验证匿名投递路径）
+func setupClientNoToken(t *testing.T, defRegion string) (*Client, *fakeFiles, *fakeFiles) {
+	t.Helper()
+	primary, backup := newFake(), newFake()
+	s1 := httptest.NewServer(primary.handler())
+	s2 := httptest.NewServer(backup.handler())
+	t.Cleanup(s1.Close)
+	t.Cleanup(s2.Close)
+	primary.url, backup.url = s1.URL, s2.URL
+
+	t.Setenv("WS_FILES_TOKEN", "")
+	t.Setenv("WS_FILES_ANON", "")
+	t.Setenv("WS_FILES_TIMEOUT", "10")
+	t.Setenv("WS_FILES_TTL_MIN", "60")
+	if defRegion == "hk" {
+		t.Setenv("WS_FILES_BASE_HK", s1.URL)
+		t.Setenv("WS_FILES_BASE_CN", s2.URL)
+	} else {
+		t.Setenv("WS_FILES_BASE_CN", s1.URL)
+		t.Setenv("WS_FILES_BASE_HK", s2.URL)
+	}
+	t.Setenv("WS_FILES_REGION", "")
+	return New(defRegion), primary, backup
+}
+
 func writeTemp(t *testing.T, name string, size int) string {
 	t.Helper()
 	dir := t.TempDir()
@@ -232,15 +276,62 @@ func writeTemp(t *testing.T, name string, size int) string {
 	return p
 }
 
-// 未配置令牌 ⇒ 禁用（SECURITY/P0：调用方据此降级，不做无意义的网络请求）
-func TestDisabledWithoutToken(t *testing.T) {
+// 默认口径：**无令牌也照常可用**（匿名模式）——零配置即可投递，服务端也不带头。
+func TestAnonDefaultWithoutToken(t *testing.T) {
 	t.Setenv("WS_FILES_TOKEN", "")
+	t.Setenv("WS_FILES_ANON", "")
+	c := New("cn")
+	if !c.Enabled() {
+		t.Fatal("默认应允许匿名投递（无需令牌）")
+	}
+	if !c.Anonymous() {
+		t.Fatal("无令牌时应报 Anonymous()=true")
+	}
+}
+
+// WS_FILES_ANON=0 ⇒ 强制要求令牌：无令牌视为禁用，调用方据此降级且不做无意义请求。
+func TestForceTokenRequiredByAnonOff(t *testing.T) {
+	t.Setenv("WS_FILES_TOKEN", "")
+	t.Setenv("WS_FILES_ANON", "0")
 	c := New("cn")
 	if c.Enabled() {
-		t.Fatal("无令牌时应为禁用")
+		t.Fatal("WS_FILES_ANON=0 且无令牌时应为禁用")
 	}
 	if _, err := c.Upload(context.Background(), "/etc/hosts", "hosts"); err != ErrDisabled {
 		t.Fatalf("应返回 ErrDisabled，实际 %v", err)
+	}
+}
+
+// 匿名模式下请求**不带**令牌头（服务端开 --allow-anonymous 时不该被旧客户端污染）
+func TestAnonSendsNoTokenHeader(t *testing.T) {
+	c, primary, _ := setupClientNoToken(t, "cn")
+	if _, err := c.Upload(context.Background(), writeTemp(t, "a.txt", 100), "a.txt"); err != nil {
+		t.Fatal(err)
+	}
+	primary.mu.Lock()
+	defer primary.mu.Unlock()
+	for _, tok := range primary.seenTokens {
+		if tok != "" {
+			t.Fatalf("匿名模式不应发送令牌头，实际 %q", tok)
+		}
+	}
+}
+
+// 服务端仍要求令牌（未开匿名）时，401 必须带上可操作的排障提示
+func TestUnauthorizedCarriesHint(t *testing.T) {
+	c, primary, backup := setupClientNoToken(t, "cn")
+	primary.mu.Lock()
+	primary.requireToken = true
+	primary.mu.Unlock()
+	backup.mu.Lock()
+	backup.requireToken = true // 两站都要求令牌 ⇒ 无法靠故障转移绕过
+	backup.mu.Unlock()
+	_, err := c.Upload(context.Background(), writeTemp(t, "a.txt", 100), "a.txt")
+	if err == nil {
+		t.Fatal("服务端要求令牌时应报错")
+	}
+	if !strings.Contains(err.Error(), "401") || !strings.Contains(err.Error(), "匿名") {
+		t.Fatalf("401 应带排障提示，实际: %v", err)
 	}
 }
 
