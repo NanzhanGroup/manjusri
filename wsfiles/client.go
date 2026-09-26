@@ -15,15 +15,20 @@
 //
 // 配置全部走环境变量（SECURITY/P0：密钥只从文件/环境读，不落盘、不进代码）：
 //
-//	WS_FILES_KEY      节点私钥路径，默认 $WS_PATH/data/family/id_ed25519（ws-core 自动生成）
-//	WS_FILES_NODE_ID  节点 id 覆盖，默认取 me.json 的 id，再退回主机名
-//	WS_FILES_CERT     节点证书路径，默认 $WS_PATH/data/family/node-cert.json（有则自动携带）
+//	WS_FILES_KEY      节点私钥路径，默认 $WS_PATH/data/node/id_ed25519（首次使用时自动生成）
+//	WS_FILES_NODE_ID  节点 id 覆盖，默认取 node.json 的 id，再退回主机名
+//	WS_FILES_CERT     节点证书路径，默认 $WS_PATH/data/node/node-cert.json（有则自动携带）
+//	WS_NODE_DIR       节点身份目录覆盖（默认 $WS_PATH/data/node）
 //	WS_FILES_TOKEN    可选令牌（运维/调试通道）；一般留空，靠节点签名
 //	WS_FILES_REGION   cn | hk | auto，默认 auto（按 New 传入的 defaultRegion，另一站兜底）
 //	WS_FILES_BASE_CN  默认 https://cn.dl.xiusoft.cn
 //	WS_FILES_BASE_HK  默认 https://hk.dl.xiusoft.cn
 //	WS_FILES_TTL_MIN  保留分钟数，默认 1440（24h，服务端上限 10080）
 //	WS_FILES_TIMEOUT  单请求超时秒数，默认 60
+//
+// ⚠️ 身份**不依赖** `data/family/`：那是文殊家族内部的标识，只有我们这套家族节点才有，
+// 客户单机部署没有该目录。节点身份统一放在中性的 `$WS_PATH/data/node/`（见 identity.go）；
+// 家族的旧路径（data/family/id_ed25519、data/family/node-cert.json）仅作**只读兼容**。
 //
 // 鉴权口径（与服务端 ws-files 0.5.0+ 一致）：**节点身份签名**（wsauth v1，见 nodeauth.go），
 // 服务端按 名册（L1）或 官方证书（L2A）验签。**调用方零配置**：私钥本来就在本机。
@@ -77,7 +82,7 @@ const (
 var ErrDisabled = errors.New("文殊文件服务不可用（读不到节点私钥且未配置 WS_FILES_TOKEN）")
 
 // ErrDisabledHint 给出可操作的排障方向（网关日志里直接可读）
-const ErrDisabledHint = "请确认 $WS_PATH/data/family/id_ed25519 存在（ws-core 启动时会自动生成），" +
+const ErrDisabledHint = "请确认 $WS_PATH/data/node/id_ed25519 存在（首次使用时自动生成，无需手工配置），" +
 	"或用 WS_FILES_KEY 指定私钥路径；仅在纯调试时才用 WS_FILES_TOKEN"
 
 // Result 一次投递的结果
@@ -97,7 +102,9 @@ type Client struct {
 	token    string
 	signer   *Identity // 节点身份（零配置上传的正途）；为空则看 token
 	signErr  error     // 加载身份失败的原因（Enabled()==false 时给日志用）
-	certText string    // 节点证书（有就带 X-WS-Cert → 服务端走 L2A）
+	idSource IdentitySource
+	certText string // 节点证书（有就带 X-WS-Cert → 服务端走 L2A）
+	certNote string // 证书装载说明（无证书/被忽略的原因；日志用）
 	baseCN   string
 	baseHK   string
 	region   string // 强制区域（cn/hk），空则按 defaultRegion
@@ -125,23 +132,49 @@ func New(defaultRegion string) *Client {
 		c.region = ""
 	}
 	// 节点身份：**零配置**的正途。读不到不致命（也许配了令牌），但要留原因给日志。
+	// 路径解析：WS_FILES_KEY > $WS_PATH/data/node/id_ed25519 > 旧 data/family/id_ed25519；
+	// 三处都没有 ⇒ 在 data/node 自动生成（客户单机部署没有 family 目录，见 identity.go）。
 	keyPath := configValue(EnvKeyPath)
 	nodeID := configValue(EnvNodeID)
-	if c.signer, c.signErr = LoadIdentity(keyPath, nodeID); c.signErr == nil {
-		certPath := configValue(EnvCertPath)
-		if certPath == "" {
-			if _, err := os.Stat(DefaultCertPath()); err == nil {
-				certPath = DefaultCertPath()
-			}
-		}
-		if certPath != "" {
-			if txt, err := LoadCertFile(certPath); err == nil {
-				c.certText = txt
-			}
-			// 证书坏了不算致命：名册（L1）通道仍可用，服务端会给出明确 401 文案
-		}
+	var src IdentitySource
+	if c.signer, src, c.signErr = OpenIdentity(keyPath, nodeID); c.signErr == nil {
+		c.idSource = src
+		c.loadCert()
 	}
 	return c
+}
+
+// loadCert 装载节点证书（env > data/node > 旧 data/family），并与本地身份做一致性校正：
+//
+//	① 证书主体里的 node 是**权威口径** —— 服务端要求 X-WS-Node 与证书主体一致，故以它为准；
+//	② 证书公钥必须等于本地私钥对应的公钥，否则该证书根本不属于这台机器（换机/换身份）：
+//	   宁可不携带（名册通道仍可用、服务端会给明确 401），也不发一张必然被拒的证书。
+func (c *Client) loadCert() {
+	certPath := DefaultCertPathResolved()
+	if certPath == "" {
+		return
+	}
+	txt, err := LoadCertFile(certPath)
+	if err != nil {
+		c.certNote = fmt.Sprintf("证书不可用（%s）: %v", certPath, err)
+		return
+	}
+	doc, err := DecodeCert(txt)
+	if err != nil {
+		c.certNote = fmt.Sprintf("证书不可用（%s）: %v", certPath, err)
+		return
+	}
+	// 先判归属：公钥不匹配 ⇒ 这张证书根本不属于这台机器（换机/换身份），
+	// **整张忽略**（连主体 id 也不采信，否则会用错 id 发签名）。
+	if p, _, perr := ParsePubKeyValue(doc.Pub); perr == nil && !bytes.Equal(p, c.signer.Pub) {
+		c.certNote = fmt.Sprintf("证书公钥与本地私钥不匹配（%s）—— 已忽略该证书；请在本机重新领证", certPath)
+		return
+	}
+	// 归属成立后，主体 id 是权威口径：服务端要求 X-WS-Node 与证书主体一致
+	if doc.Node != "" && doc.Node != c.signer.Node {
+		c.signer.Node = doc.Node
+	}
+	c.certText = txt
 }
 
 // Enabled 是否可用：有节点身份（零配置的正途）或有令牌（运维通道）即可。
@@ -177,6 +210,24 @@ func (c *Client) NodeID() string {
 
 // HasCert 是否携带证书（日志/排障用：证书走 L2A，无名册也能过）
 func (c *Client) HasCert() bool { return c != nil && c.certText != "" }
+
+// IdentitySourceOf 本节点私钥来源（日志/排障用）。
+// 取值 "node"/"node-generated" = 中性节点身份；"family-legacy" = 家族旧路径（仅家族节点）；
+// "env" = WS_FILES_KEY 显式指定；"" = 身份未加载。
+func (c *Client) IdentitySourceOf() IdentitySource {
+	if c == nil {
+		return ""
+	}
+	return c.idSource
+}
+
+// CertNote 证书装载说明：无证书时为空；有异常时说明为何未携带（不含任何密钥材料）
+func (c *Client) CertNote() string {
+	if c == nil {
+		return ""
+	}
+	return c.certNote
+}
 
 // applyAuth 附加鉴权：**优先节点签名**（零配置），其次令牌。
 //
@@ -562,8 +613,9 @@ func (c *Client) postJSON(ctx context.Context, url string, payload any, out *api
 func authErrHint(status int, code, msg string) string {
 	switch {
 	case status == http.StatusUnauthorized:
-		return msg + "（节点鉴权未通过：请确认本机 $WS_PATH/data/family/id_ed25519 与官方登记一致；" +
-			"新节点需加入名册或领取官方证书 node-cert.json；证书过期请联系管理员换发）"
+		return msg + "（节点鉴权未通过：请确认本机 $WS_PATH/data/node/id_ed25519 与官方登记一致；" +
+			"新节点先 wst-nodecert csr 领证（官方签发后 install 到 node-cert.json），或由官方登记进名册；" +
+			"证书过期请联系管理员换发）"
 	case code == codeQuotaDaily:
 		// 服务端文案已说明"重试无效"，**不要再补"稍后重试即可"** —— 自相矛盾会把排障带偏
 		return msg

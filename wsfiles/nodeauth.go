@@ -3,8 +3,11 @@ package wsfiles
 // nodeauth.go —— 客户端侧节点身份签名（wsauth v1）
 //
 // 目的：**让文殊节点零配置就能往 ws-files 上传**。做法不是配令牌，而是用每台机器
-// **本来就有的** Ed25519 身份（`$WS_PATH/data/family/id_ed25519`，ws-core 启动时自动生成），
+// **自己的** Ed25519 节点身份（`$WS_PATH/data/node/id_ed25519`，首次使用时自动生成；见 identity.go），
 // 对每个写请求签名。服务端按 名册（L1）或 官方证书（L2A）验签。
+//
+// ⚠️ 身份**不放在** `data/family/`：那是**文殊家族内部的标识**（家族名册/家族私钥），
+// 只有我们这套家族节点才有 —— 客户单机部署没有该目录。family 路径仅作为**旧路径兼容**（只读）保留。
 //
 // 协议（与服务端 ws-files/nodeauth.go 逐字节一致）：
 //
@@ -13,7 +16,7 @@ package wsfiles
 //	X-WS-Ts:    <unix 秒>
 //	X-WS-Nonce: <base64url(16B) 一次性>
 //	X-WS-Sig:   <base64(Ed25519(私钥, 待签串))>
-//	X-WS-Cert:  <可选 base64url(证书 JSON)>   ← 有 data/family/node-cert.json 时自动带上
+//	X-WS-Cert:  <可选 base64url(证书 JSON)>   ← 有 node-cert.json 时自动带上（路径解析见 identity.go）
 //
 // 待签串：v1 \n METHOD \n path(URL 转义,不含 query) \n ts \n nonce \n hex(sha256(body))
 //
@@ -28,11 +31,9 @@ import (
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/hex"
-	"encoding/json"
 	"fmt"
 	"net/http"
 	"os"
-	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
@@ -50,11 +51,11 @@ const (
 	// AuthVersion 协议版本
 	AuthVersion = "v1"
 
-	// EnvKeyPath 私钥路径覆盖（默认 $WS_PATH/data/family/id_ed25519）
+	// EnvKeyPath 私钥路径覆盖（默认 $WS_PATH/data/node/id_ed25519）
 	EnvKeyPath = "WS_FILES_KEY"
-	// EnvNodeID 节点 id 覆盖（默认取 me.json 的 id，再退回主机名）
+	// EnvNodeID 节点 id 覆盖（默认取 node.json 的 id，再退回主机名）
 	EnvNodeID = "WS_FILES_NODE_ID"
-	// EnvCertPath 证书路径覆盖（默认 $WS_PATH/data/family/node-cert.json）
+	// EnvCertPath 证书路径覆盖（默认 $WS_PATH/data/node/node-cert.json）
 	EnvCertPath = "WS_FILES_CERT"
 )
 
@@ -67,11 +68,27 @@ type Identity struct {
 	KeyPath string
 }
 
-// DefaultKeyPath 默认私钥路径：$WS_PATH/data/family/id_ed25519
-func DefaultKeyPath() string { return filepath.Join(wsPath(), "data", "family", "id_ed25519") }
+// DefaultKeyPath 默认私钥路径：$WS_PATH/data/node/id_ed25519（中性节点身份）。
+// 旧 family 路径由 ResolveKeyPath 作为只读兼容处理。
+func DefaultKeyPath() string { return NodeKeyPath() }
 
-// DefaultCertPath 默认证书路径：$WS_PATH/data/family/node-cert.json
-func DefaultCertPath() string { return filepath.Join(wsPath(), "data", "family", "node-cert.json") }
+// DefaultCertPath 默认证书路径：$WS_PATH/data/node/node-cert.json
+func DefaultCertPath() string { return NodeCertPath() }
+
+// DefaultCertPathResolved 实际生效的证书路径：env > data/node > 旧 data/family（只读兼容）。
+// 都没有时返回 ""（表示"不携带证书"，名册通道仍可用）。
+func DefaultCertPathResolved() string {
+	if v := strings.TrimSpace(configValue(EnvCertPath)); v != "" {
+		return v
+	}
+	if fileExists(NodeCertPath()) {
+		return NodeCertPath()
+	}
+	if fileExists(LegacyFamilyCertPath()) {
+		return LegacyFamilyCertPath()
+	}
+	return ""
+}
 
 // wsPath 运行根：WS_PATH > /etc/environment 的 WS_PATH > /data/app/ws
 func wsPath() string {
@@ -84,12 +101,35 @@ func wsPath() string {
 	return "/data/app/ws"
 }
 
-// LoadIdentity 读取本节点身份。keyPath 为空时用 DefaultKeyPath()；
-// nodeID 为空时按 WS_FILES_NODE_ID → me.json 的 id → 主机名 依次推断。
-// **不生成密钥**（生成是 ws-core 的职责）：文件不存在即报错，由调用方决定降级方式。
+// OpenIdentity 客户端口径：keyPath 为空时按 WS_FILES_KEY > data/node > data/family 解析，
+// **三处都没有就在 data/node 生成一份**（客户零配置的落点），并回传来源便于日志区分。
+// 显式指定 keyPath 时**不生成** —— 那是配置错误，应当明确报错，而不是悄悄造一把新密钥。
+func OpenIdentity(keyPath, nodeID string) (*Identity, IdentitySource, error) {
+	if strings.TrimSpace(keyPath) != "" {
+		id, err := LoadIdentity(keyPath, nodeID)
+		return id, SourceEnv, err
+	}
+	p, src, err := EnsureKeyPath()
+	if err != nil {
+		return nil, "", err
+	}
+	id, err := LoadIdentity(p, nodeID)
+	if err != nil {
+		return nil, src, err
+	}
+	return id, src, nil
+}
+
+// LoadIdentity 读取本节点身份。keyPath 为空时按 ResolveKeyPath() 解析（env > data/node > 旧 data/family）。
+// nodeID 为空时按 WS_FILES_NODE_ID → WS_NODE_ID → node.json → 旧 family/me.json → 主机名 依次推断。
+// **不生成密钥**（生成是 OpenIdentity / InitNodeIdentity 的职责）：文件不存在即报错，由调用方决定降级方式。
 func LoadIdentity(keyPath, nodeID string) (*Identity, error) {
 	if strings.TrimSpace(keyPath) == "" {
-		keyPath = DefaultKeyPath()
+		if p, _ := ResolveKeyPath(); p != "" {
+			keyPath = p
+		} else {
+			keyPath = DefaultKeyPath()
+		}
 	}
 	raw, err := os.ReadFile(keyPath)
 	if err != nil {
@@ -100,31 +140,9 @@ func LoadIdentity(keyPath, nodeID string) (*Identity, error) {
 		return nil, fmt.Errorf("解析节点私钥失败（%s）: %w", keyPath, err)
 	}
 	if strings.TrimSpace(nodeID) == "" {
-		nodeID = configValue(EnvNodeID)
-	}
-	if strings.TrimSpace(nodeID) == "" {
-		nodeID = readMeID()
-	}
-	if strings.TrimSpace(nodeID) == "" {
-		h, _ := os.Hostname()
-		nodeID = "node:" + h
+		nodeID = ResolveNodeID()
 	}
 	return &Identity{Node: nodeID, Priv: priv, Pub: pub, FP: KeyFingerprint(pub), KeyPath: keyPath}, nil
-}
-
-// readMeID 读 $WS_PATH/data/family/me.json 的 id 字段
-func readMeID() string {
-	b, err := os.ReadFile(filepath.Join(wsPath(), "data", "family", "me.json"))
-	if err != nil {
-		return ""
-	}
-	var m struct {
-		ID string `json:"id"`
-	}
-	if err := json.Unmarshal(b, &m); err != nil {
-		return ""
-	}
-	return strings.TrimSpace(m.ID)
 }
 
 // AuthPayload 待签串（客户端/服务端必须逐字节一致）
