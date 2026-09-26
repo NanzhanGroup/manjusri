@@ -4,11 +4,11 @@ package wsfiles
 //
 // 启用方式（不要用生产令牌做破坏性测试，建议本地起一个实例）：
 //
-//	# 带令牌
-//	WSFILES_E2E_BASE=http://127.0.0.1:9547 WSFILES_E2E_TOKEN=xxx \
+//	# 节点签名（正途：客户端零配置，服务端以 --roster 或 --trust-root 启动）
+//	WSFILES_E2E_BASE=http://127.0.0.1:9547 \
 //	  go test ./wsfiles/ -run TestE2E -v -count=1
-//	# 匿名（服务端以 --allow-anonymous 启动，客户端零配置）
-//	WSFILES_E2E_BASE=http://127.0.0.1:9547 WSFILES_E2E_ANON=1 \
+//	# 令牌（服务端以 --token 启动时的调试通道）
+//	WSFILES_E2E_BASE=http://127.0.0.1:9547 WSFILES_E2E_TOKEN=xxx \
 //	  go test ./wsfiles/ -run TestE2E -v -count=1
 //
 // 覆盖：小文件单发 / 大文件分块 / 下载回读 sha256 一致 / 回收后 404。
@@ -30,12 +30,17 @@ func e2eClient(t *testing.T) *Client {
 	t.Helper()
 	base := os.Getenv("WSFILES_E2E_BASE")
 	tok := os.Getenv("WSFILES_E2E_TOKEN")
-	anon := os.Getenv("WSFILES_E2E_ANON") == "1"
-	if base == "" || (tok == "" && !anon) {
-		t.Skip("未设置 WSFILES_E2E_BASE / WSFILES_E2E_TOKEN（或 WSFILES_E2E_ANON=1），跳过真实服务端到端测试")
+	if base == "" {
+		t.Skip("未设置 WSFILES_E2E_BASE，跳过真实服务端到端测试")
 	}
 	t.Setenv("WS_FILES_TOKEN", tok)
-	t.Setenv("WS_FILES_ANON", "") // 默认口径：允许匿名
+	if tok == "" && os.Getenv("WSFILES_E2E_KEY") == "" {
+		// 正途：本机节点身份（data/family/id_ed25519）自动签名，无需任何配置
+		t.Log("未设 WSFILES_E2E_KEY / WSFILES_E2E_TOKEN ⇒ 用本机节点身份签名（零配置口径）")
+	}
+	if k := os.Getenv("WSFILES_E2E_KEY"); k != "" {
+		t.Setenv(EnvKeyPath, k)
+	}
 	t.Setenv("WS_FILES_BASE_CN", base)
 	t.Setenv("WS_FILES_BASE_HK", base)
 	t.Setenv("WS_FILES_REGION", "cn")

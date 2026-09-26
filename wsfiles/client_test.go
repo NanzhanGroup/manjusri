@@ -1,7 +1,9 @@
 package wsfiles
 
 import (
+	"bytes"
 	"context"
+	"crypto/ed25519"
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/hex"
@@ -34,9 +36,13 @@ type fakeFiles struct {
 	gotSHA     map[string]string // upload_id → 声明的 sha256
 	chunksRecv map[string]map[int]string
 
-	// 鉴权口径（默认「匿名接收」：不校验令牌，与开启 --allow-anonymous 的服务端一致）
-	requireToken bool     // true ⇒ 模拟未开匿名的服务端（fail-closed）
-	seenTokens   []string // 每个请求实际带到的令牌头（验证「匿名不发头」）
+	// 鉴权口径：默认按 wsauth v1 校验**节点签名**（与 ws-files 0.5.0+ 一致）
+	requireSig bool // true ⇒ 按协议验签，签名不对即 401
+	pub        ed25519.PublicKey
+	seenTokens []string // 每个请求实际带到的令牌头（断言"签名模式不发令牌"）
+	seenNonces []string // 每个请求的 nonce（断言"重试必须重签"）
+	seenCerts  []string // 每个请求携带的证书
+	badSigs    int      // 验签失败次数
 }
 
 func newFake() *fakeFiles {
@@ -192,16 +198,32 @@ func (f *fakeFiles) handler() http.Handler {
 	return f.serve(mux)
 }
 
-// serve 统一入口：记录令牌头（验证「匿名模式不带令牌头」），并按 requireToken 模拟鉴权
+// serve 统一入口：记录鉴权头，并在 requireSig 时**按协议验签**（验证客户端真的签对了）。
+//
+// 验签要读请求体摘要，故读入后**原样放回**，不影响后续 handler。
 func (f *fakeFiles) serve(mux *http.ServeMux) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		r.Body = io.NopCloser(bytes.NewReader(body))
+
 		f.mu.Lock()
 		f.seenTokens = append(f.seenTokens, r.Header.Get(tokenHeader))
-		need := f.requireToken
+		if r.Method != http.MethodGet { // 读接口不带签名（公开），只统计写请求
+			f.seenNonces = append(f.seenNonces, r.Header.Get(HeaderNonce))
+			f.seenCerts = append(f.seenCerts, r.Header.Get(HeaderCert))
+		}
+		need, pub := f.requireSig, f.pub
 		f.mu.Unlock()
-		if need && r.Header.Get(tokenHeader) == "" {
-			writeJ(w, 401, map[string]any{"ok": false, "error": "令牌无效或缺失"})
-			return
+
+		// 只有**写**操作需要签名（读接口 /api/info、/f/… 公开）
+		if need && r.Method != http.MethodGet {
+			if _, _, ok := verifyNodeSig(r, body, pub); !ok {
+				f.mu.Lock()
+				f.badSigs++
+				f.mu.Unlock()
+				writeJ(w, 401, map[string]any{"ok": false, "error": "节点签名校验失败"})
+				return
+			}
 		}
 		mux.ServeHTTP(w, r)
 	})
@@ -216,14 +238,16 @@ func writeJ(w http.ResponseWriter, code int, v any) {
 // setupClient 起两个假站点（主/备）并返回客户端与两个 fake
 func setupClient(t *testing.T, defRegion string) (*Client, *fakeFiles, *fakeFiles) {
 	t.Helper()
+	pub, _ := installTestIdentity(t) // 节点身份：**零配置**上传的正途
 	primary, backup := newFake(), newFake()
+	primary.requireSig, primary.pub = true, pub
+	backup.requireSig, backup.pub = true, pub
 	s1 := httptest.NewServer(primary.handler())
 	s2 := httptest.NewServer(backup.handler())
 	t.Cleanup(s1.Close)
 	t.Cleanup(s2.Close)
 	primary.url, backup.url = s1.URL, s2.URL
 
-	t.Setenv("WS_FILES_TOKEN", "test-token")
 	t.Setenv("WS_FILES_TIMEOUT", "10")
 	t.Setenv("WS_FILES_TTL_MIN", "60")
 	if defRegion == "hk" {
@@ -237,9 +261,11 @@ func setupClient(t *testing.T, defRegion string) (*Client, *fakeFiles, *fakeFile
 	return New(defRegion), primary, backup
 }
 
-// setupClientNoToken 同 setupClient，但**不配令牌**（验证匿名投递路径）
-func setupClientNoToken(t *testing.T, defRegion string) (*Client, *fakeFiles, *fakeFiles) {
+// setupClientNoAuth 同 setupClient，但**既无身份也无令牌**（验证"禁用"路径）
+func setupClientNoAuth(t *testing.T, defRegion string) (*Client, *fakeFiles, *fakeFiles) {
 	t.Helper()
+	t.Setenv(EnvKeyPath, filepath.Join(t.TempDir(), "no-such-key"))
+	t.Setenv(EnvNodeID, "")
 	primary, backup := newFake(), newFake()
 	s1 := httptest.NewServer(primary.handler())
 	s2 := httptest.NewServer(backup.handler())
@@ -248,7 +274,6 @@ func setupClientNoToken(t *testing.T, defRegion string) (*Client, *fakeFiles, *f
 	primary.url, backup.url = s1.URL, s2.URL
 
 	t.Setenv("WS_FILES_TOKEN", "")
-	t.Setenv("WS_FILES_ANON", "")
 	t.Setenv("WS_FILES_TIMEOUT", "10")
 	t.Setenv("WS_FILES_TTL_MIN", "60")
 	if defRegion == "hk" {
@@ -276,35 +301,49 @@ func writeTemp(t *testing.T, name string, size int) string {
 	return p
 }
 
-// 默认口径：**无令牌也照常可用**（匿名模式）——零配置即可投递，服务端也不带头。
-func TestAnonDefaultWithoutToken(t *testing.T) {
-	t.Setenv("WS_FILES_TOKEN", "")
-	t.Setenv("WS_FILES_ANON", "")
+// 零配置口径：**没有令牌也照常可用** —— 靠本机节点私钥签名（ws-core 自动生成的 id_ed25519）。
+func TestNodeIdentityWithoutAnyConfig(t *testing.T) {
+	pub, node := installTestIdentity(t)
 	c := New("cn")
 	if !c.Enabled() {
-		t.Fatal("默认应允许匿名投递（无需令牌）")
+		t.Fatal("有节点身份时应可用（这正是『零配置』的含义）")
 	}
-	if !c.Anonymous() {
-		t.Fatal("无令牌时应报 Anonymous()=true")
+	if c.NodeID() != node {
+		t.Fatalf("NodeID 应为 %s，实际 %s", node, c.NodeID())
+	}
+	if c.token != "" {
+		t.Fatal("测试前提：未配令牌")
+	}
+
+	// 真发一次，且让服务端验签 —— 证明"可用"不是嘴上说说
+	f := newFake()
+	f.requireSig, f.pub = true, pub
+	srv := newHTTPTestServer(t, f)
+	t.Setenv("WS_FILES_BASE_CN", srv)
+	t.Setenv("WS_FILES_BASE_HK", srv)
+	c = New("cn")
+	if _, err := c.Upload(context.Background(), writeTemp(t, "a.txt", 100), "a.txt"); err != nil {
+		t.Fatal(err)
+	}
+	if f.badSigs != 0 {
+		t.Fatalf("签名未通过服务端验签（badSigs=%d）", f.badSigs)
 	}
 }
 
-// WS_FILES_ANON=0 ⇒ 强制要求令牌：无令牌视为禁用，调用方据此降级且不做无意义请求。
-func TestForceTokenRequiredByAnonOff(t *testing.T) {
-	t.Setenv("WS_FILES_TOKEN", "")
-	t.Setenv("WS_FILES_ANON", "0")
-	c := New("cn")
+// 既读不到私钥、也没有令牌 ⇒ 禁用，且原因可操作；Upload 直接返回 ErrDisabled（不做无意义请求）
+func TestNoKeyNoTokenIsDisabled(t *testing.T) {
+	c, _, _ := setupClientNoAuth(t, "cn")
 	if c.Enabled() {
-		t.Fatal("WS_FILES_ANON=0 且无令牌时应为禁用")
+		t.Fatal("无身份、无令牌时应为禁用")
 	}
 	if _, err := c.Upload(context.Background(), "/etc/hosts", "hosts"); err != ErrDisabled {
 		t.Fatalf("应返回 ErrDisabled，实际 %v", err)
 	}
 }
 
-// 匿名模式下请求**不带**令牌头（服务端开 --allow-anonymous 时不该被旧客户端污染）
-func TestAnonSendsNoTokenHeader(t *testing.T) {
-	c, primary, _ := setupClientNoToken(t, "cn")
+// 签名模式**不发令牌头**（令牌是可选的第二条通道，不该被无谓地广播出去）
+func TestSignedRequestCarriesNoTokenHeader(t *testing.T) {
+	c, primary, _ := setupClient(t, "cn")
 	if _, err := c.Upload(context.Background(), writeTemp(t, "a.txt", 100), "a.txt"); err != nil {
 		t.Fatal(err)
 	}
@@ -312,26 +351,37 @@ func TestAnonSendsNoTokenHeader(t *testing.T) {
 	defer primary.mu.Unlock()
 	for _, tok := range primary.seenTokens {
 		if tok != "" {
-			t.Fatalf("匿名模式不应发送令牌头，实际 %q", tok)
+			t.Fatalf("签名模式不应发送令牌头，实际 %q", tok)
 		}
 	}
 }
 
-// 服务端仍要求令牌（未开匿名）时，401 必须带上可操作的排障提示
+// 服务端验签不过（如本机身份与登记公钥不一致）⇒ 401 必须带可操作的排障提示
 func TestUnauthorizedCarriesHint(t *testing.T) {
-	c, primary, backup := setupClientNoToken(t, "cn")
-	primary.mu.Lock()
-	primary.requireToken = true
-	primary.mu.Unlock()
-	backup.mu.Lock()
-	backup.requireToken = true // 两站都要求令牌 ⇒ 无法靠故障转移绕过
-	backup.mu.Unlock()
-	_, err := c.Upload(context.Background(), writeTemp(t, "a.txt", 100), "a.txt")
-	if err == nil {
-		t.Fatal("服务端要求令牌时应报错")
+	_, _ = installTestIdentity(t) // 客户端自己的身份
+	otherPub, _, _ := ed25519.GenerateKey(nil)
+	c, primary, backup := setupClientNoAuth(t, "cn")
+	// 手工启用签名通道，但服务端认的是**另一把公钥** —— 模拟"换了机器/身份"
+	localPub, _ := installTestIdentity(t)
+	id, err := LoadIdentity(os.Getenv(EnvKeyPath), "")
+	if err != nil {
+		t.Fatal(err)
 	}
-	if !strings.Contains(err.Error(), "401") || !strings.Contains(err.Error(), "匿名") {
-		t.Fatalf("401 应带排障提示，实际: %v", err)
+	_ = localPub
+	c.signer, c.signErr = id, nil
+	primary.mu.Lock()
+	primary.requireSig, primary.pub = true, otherPub
+	backup.mu.Lock()
+	backup.requireSig, backup.pub = true, otherPub
+	backup.mu.Unlock()
+	primary.mu.Unlock()
+
+	_, err = c.Upload(context.Background(), writeTemp(t, "a.txt", 100), "a.txt")
+	if err == nil {
+		t.Fatal("签名不被认可时应报错")
+	}
+	if !strings.Contains(err.Error(), "401") || !strings.Contains(err.Error(), "id_ed25519") {
+		t.Fatalf("401 应带排障提示（指明私钥/名册/证书方向），实际: %v", err)
 	}
 }
 

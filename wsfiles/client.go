@@ -13,20 +13,21 @@
 //
 // 站点限流：每 IP 600 请求/分钟，超限回 429；接口全部幂等，重试安全（本包已内置退避重试）。
 //
-// 配置全部走环境变量（SECURITY/P0：令牌只注入环境，不落盘、不进代码）：
+// 配置全部走环境变量（SECURITY/P0：密钥只从文件/环境读，不落盘、不进代码）：
 //
-//	WS_FILES_TOKEN    写操作令牌；**可选**——留空即匿名模式（默认允许）
-//	                  （**只从进程环境读**，SECURITY/P0：密钥不落盘、不进代码）
-//	WS_FILES_ANON     =0 强制要求令牌（无令牌时 Enabled()=false，调用方跳过/降级）；
-//	                  默认（未设或 =1）允许匿名：无令牌也照常投递
+//	WS_FILES_KEY      节点私钥路径，默认 $WS_PATH/data/family/id_ed25519（ws-core 自动生成）
+//	WS_FILES_NODE_ID  节点 id 覆盖，默认取 me.json 的 id，再退回主机名
+//	WS_FILES_CERT     节点证书路径，默认 $WS_PATH/data/family/node-cert.json（有则自动携带）
+//	WS_FILES_TOKEN    可选令牌（运维/调试通道）；一般留空，靠节点签名
 //	WS_FILES_REGION   cn | hk | auto，默认 auto（按 New 传入的 defaultRegion，另一站兜底）
 //	WS_FILES_BASE_CN  默认 https://cn.dl.xiusoft.cn
 //	WS_FILES_BASE_HK  默认 https://hk.dl.xiusoft.cn
 //	WS_FILES_TTL_MIN  保留分钟数，默认 1440（24h，服务端上限 10080）
 //	WS_FILES_TIMEOUT  单请求超时秒数，默认 60
 //
-// 令牌与服务端的关系：服务端默认 fail-closed（未配令牌则拒绝写操作），
-// 需以 --allow-anonymous / WS_FILES_ANON=1 显式开启匿名接收；两端都不配即「零配置可用」。
+// 鉴权口径（与服务端 ws-files 0.5.0+ 一致）：**节点身份签名**（wsauth v1，见 nodeauth.go），
+// 服务端按 名册（L1）或 官方证书（L2A）验签。**调用方零配置**：私钥本来就在本机。
+// 令牌是可选的第二条通道（运维/调试）；两者都没有 ⇒ Enabled()=false，调用方跳过投递。
 //
 // 除令牌外的配置项读取顺序：进程环境 > /etc/environment > $WS_PATH/.env。
 package wsfiles
@@ -69,8 +70,12 @@ const (
 	tokenHeader = "X-WS-Files-Token"
 )
 
-// ErrDisabled 服务被显式关闭（未配令牌且 WS_FILES_ANON=0）
-var ErrDisabled = errors.New("文殊文件服务未启用（未配置 WS_FILES_TOKEN 且 WS_FILES_ANON=0）")
+// ErrDisabled 文件服务不可用：既没有节点身份（私钥不可读），也没有令牌
+var ErrDisabled = errors.New("文殊文件服务不可用（读不到节点私钥且未配置 WS_FILES_TOKEN）")
+
+// ErrDisabledHint 给出可操作的排障方向（网关日志里直接可读）
+const ErrDisabledHint = "请确认 $WS_PATH/data/family/id_ed25519 存在（ws-core 启动时会自动生成），" +
+	"或用 WS_FILES_KEY 指定私钥路径；仅在纯调试时才用 WS_FILES_TOKEN"
 
 // Result 一次投递的结果
 type Result struct {
@@ -86,14 +91,16 @@ type Result struct {
 
 // Client 文件服务客户端（并发安全：内部无可变共享状态，除 chunkSize 缓存外）
 type Client struct {
-	token  string
-	anon   bool // 允许匿名（无令牌）投递；WS_FILES_ANON=0 时为 false
-	baseCN string
-	baseHK string
-	region string // 强制区域（cn/hk），空则按 defaultRegion
-	defReg string
-	ttlMin int
-	hc     *http.Client
+	token    string
+	signer   *Identity // 节点身份（零配置上传的正途）；为空则看 token
+	signErr  error     // 加载身份失败的原因（Enabled()==false 时给日志用）
+	certText string    // 节点证书（有就带 X-WS-Cert → 服务端走 L2A）
+	baseCN   string
+	baseHK   string
+	region   string // 强制区域（cn/hk），空则按 defaultRegion
+	defReg   string
+	ttlMin   int
+	hc       *http.Client
 }
 
 // New 按环境变量构造客户端。defaultRegion 是本模块建议的站点（"cn" / "hk"）：
@@ -102,7 +109,6 @@ type Client struct {
 func New(defaultRegion string) *Client {
 	c := &Client{
 		token:  strings.TrimSpace(os.Getenv("WS_FILES_TOKEN")),
-		anon:   anonAllowed(),
 		baseCN: envStr("WS_FILES_BASE_CN", DefaultBaseCN),
 		baseHK: envStr("WS_FILES_BASE_HK", DefaultBaseHK),
 		region: strings.ToLower(configValue("WS_FILES_REGION")),
@@ -115,35 +121,77 @@ func New(defaultRegion string) *Client {
 	if c.region == "auto" {
 		c.region = ""
 	}
+	// 节点身份：**零配置**的正途。读不到不致命（也许配了令牌），但要留原因给日志。
+	keyPath := configValue(EnvKeyPath)
+	nodeID := configValue(EnvNodeID)
+	if c.signer, c.signErr = LoadIdentity(keyPath, nodeID); c.signErr == nil {
+		certPath := configValue(EnvCertPath)
+		if certPath == "" {
+			if _, err := os.Stat(DefaultCertPath()); err == nil {
+				certPath = DefaultCertPath()
+			}
+		}
+		if certPath != "" {
+			if txt, err := LoadCertFile(certPath); err == nil {
+				c.certText = txt
+			}
+			// 证书坏了不算致命：名册（L1）通道仍可用，服务端会给出明确 401 文案
+		}
+	}
 	return c
 }
 
-// anonAllowed 是否允许匿名投递：默认允许；WS_FILES_ANON=0/false 时强制要求令牌。
-func anonAllowed() bool {
-	v := strings.TrimSpace(configValue("WS_FILES_ANON"))
-	if v == "" {
-		return true // 默认：零配置可用（无需到处配令牌）
-	}
-	return v != "0" && !strings.EqualFold(v, "false") && !strings.EqualFold(v, "no")
-}
-
-// Enabled 是否可用：有令牌 ⇒ 用令牌；无令牌 ⇒ 匿名模式（默认允许，WS_FILES_ANON=0 可强制关闭）。
+// Enabled 是否可用：有节点身份（零配置的正途）或有令牌（运维通道）即可。
+// 两者都没有 ⇒ 不可用，调用方应跳过投递（原因见 Err()）。
 func (c *Client) Enabled() bool {
 	if c == nil {
 		return false
 	}
-	return c.token != "" || c.anon
+	return c.signer != nil || c.token != ""
 }
 
-// Anonymous 是否以匿名（无令牌）方式投递 —— 供日志/自检展示。
-func (c *Client) Anonymous() bool { return c != nil && c.token == "" && c.anon }
+// Err 不可用时说明原因（可读、可操作）
+func (c *Client) Err() error {
+	if c == nil {
+		return ErrDisabled
+	}
+	if c.Enabled() {
+		return nil
+	}
+	if c.signErr != nil {
+		return fmt.Errorf("%w；%s（加载失败: %v）", ErrDisabled, ErrDisabledHint, c.signErr)
+	}
+	return fmt.Errorf("%w；%s", ErrDisabled, ErrDisabledHint)
+}
 
-// setAuth 附加鉴权头：仅在配置了令牌时发送（匿名模式下不带该头，服务端也不校验）。
-func (c *Client) setAuth(req *http.Request) {
+// NodeID 本节点 id（日志/排障用；未加载身份时为空）
+func (c *Client) NodeID() string {
+	if c == nil || c.signer == nil {
+		return ""
+	}
+	return c.signer.Node
+}
+
+// HasCert 是否携带证书（日志/排障用：证书走 L2A，无名册也能过）
+func (c *Client) HasCert() bool { return c != nil && c.certText != "" }
+
+// applyAuth 附加鉴权：**优先节点签名**（零配置），其次令牌。
+//
+// body 必须与真正发送的字节一致（签名覆盖其摘要）。每次调用都生成新的 ts/nonce ——
+// 所以**重试路径必须重新调用本函数**，否则会被服务端当重放拒绝。
+func (c *Client) applyAuth(req *http.Request, body []byte) {
+	if c.signatureOK() {
+		if err := c.signer.SignRequest(req, body, c.certText); err == nil {
+			return
+		}
+	}
 	if c.token != "" {
 		req.Header.Set(tokenHeader, c.token)
 	}
 }
+
+// signatureOK 有可用身份（且非纯令牌模式）
+func (c *Client) signatureOK() bool { return c != nil && c.signer != nil }
 
 // TTLMin 返回生效的保留分钟数
 func (c *Client) TTLMin() int {
@@ -270,7 +318,7 @@ func (c *Client) deleteAt(ctx context.Context, base, id string) (bool, error) {
 	if err != nil {
 		return false, err
 	}
-	c.setAuth(req)
+	c.applyAuth(req, nil) // 无请求体：摘要取空体
 	resp, err := c.hc.Do(req)
 	if err != nil {
 		return false, err
@@ -314,7 +362,7 @@ func (c *Client) uploadSingle(ctx context.Context, base, path, name string) (*Re
 		return nil, err
 	}
 	req.Header.Set("Content-Type", mw.FormDataContentType())
-	c.setAuth(req)
+	c.applyAuth(req, buf.Bytes()) // 签名覆盖真实发送的 multipart 体
 
 	resp, err := c.hc.Do(req)
 	if err != nil {
@@ -470,7 +518,7 @@ func (c *Client) postJSON(ctx context.Context, url string, payload any, out *api
 			return err
 		}
 		req.Header.Set("Content-Type", "application/json")
-		c.setAuth(req)
+		c.applyAuth(req, body) // ← 每轮都重签：重试必须换新 ts/nonce，否则被判重放
 
 		resp, err := c.hc.Do(req)
 		if err != nil {
@@ -499,14 +547,18 @@ func (c *Client) postJSON(ctx context.Context, url string, payload any, out *api
 // ---------- 工具 ----------
 
 // authErrHint 给 401 补上可操作的排障提示。
-// 401 在「两端令牌口径不一致」时最容易出现：客户端没带令牌而服务端没开匿名，
-// 或客户端带了令牌而服务端配的是另一个。直接照原样抛出去，排障要绕一大圈。
+// 401 的常见来源（按概率排序）：① 本机私钥与服务端登记的公钥不一致（换过机器/身份）；
+// ② 本节点既不在名册、也没带有效证书；③ 证书过期/被吊销；④ 节点未授权该操作（scope）。
+// 服务端会回具体原因，这里只补"下一步该做什么"。
 func authErrHint(status int, msg string) string {
-	if status != http.StatusUnauthorized {
-		return msg
+	switch status {
+	case http.StatusUnauthorized:
+		return msg + "（节点鉴权未通过：请确认本机 $WS_PATH/data/family/id_ed25519 与官方登记一致；" +
+			"新节点需加入名册或领取官方证书 node-cert.json；证书过期请联系管理员换发）"
+	case http.StatusTooManyRequests:
+		return msg + "（请求被限流：本节点配额或站点限流。接口幂等，稍后重试即可）"
 	}
-	return msg + "（服务端拒绝写操作：它可能仍要求令牌、或未开启匿名接收。请让服务端以" +
-		"--allow-anonymous / WS_FILES_ANON=1 启动，或在本机配置 WS_FILES_TOKEN）"
+	return msg
 }
 
 // sha256File 计算整份文件摘要（init 时上报，complete 时服务端校验）
