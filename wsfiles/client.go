@@ -614,8 +614,8 @@ func authErrHint(status int, code, msg string) string {
 	switch {
 	case status == http.StatusUnauthorized:
 		return msg + "（节点鉴权未通过：请确认本机 $WS_PATH/data/node/id_ed25519 与官方登记一致；" +
-			"新节点先 wst-nodecert csr 领证（官方签发后 install 到 node-cert.json），或由官方登记进名册；" +
-			"证书过期请联系管理员换发）"
+			"新节点走 wst-nodecert apply 申请（官方审批后回信，再用 wst-nodecert install 装到 data/node/node-cert.json），" +
+			"或由官方登记进名册；证书过期请联系管理员换发）"
 	case code == codeQuotaDaily:
 		// 服务端文案已说明"重试无效"，**不要再补"稍后重试即可"** —— 自相矛盾会把排障带偏
 		return msg
