@@ -17,6 +17,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 )
 
 // fakeFiles 一个最小可用的 ws-files 假服务：单发 + init/chunk/complete/abort + delete。
@@ -43,6 +44,7 @@ type fakeFiles struct {
 	seenNonces []string // 每个请求的 nonce（断言"重试必须重签"）
 	seenCerts  []string // 每个请求携带的证书
 	badSigs    int      // 验签失败次数
+	quotaInit  int      // 还需回几次「当日配额用尽」(429 + code=quota_daily)
 }
 
 func newFake() *fakeFiles {
@@ -106,6 +108,19 @@ func (f *fakeFiles) handler() http.Handler {
 		})
 	})
 	mux.HandleFunc("/api/upload/init", func(w http.ResponseWriter, r *http.Request) {
+		f.mu.Lock()
+		if f.quotaInit > 0 {
+			f.quotaInit--
+			f.initHits++
+			f.mu.Unlock()
+			// 服务端真实口径：当日配额用尽 ⇒ 429 + code=quota_daily（重试无意义）
+			writeJ(w, http.StatusTooManyRequests, map[string]any{
+				"ok": false, "code": "quota_daily",
+				"error": "节点 wsa-testnode 今日上传额度已用尽（本次 1.5MB，剩余 0B，上限 1.0MB）—— 重试无效",
+			})
+			return
+		}
+		f.mu.Unlock()
 		var req struct {
 			Filename string `json:"filename"`
 			Size     int64  `json:"size"`
@@ -607,4 +622,37 @@ func (f *fakeFiles) counts() (single, chunk, init int) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return f.singleHits, f.chunkHits, f.initHits
+}
+
+// 服务端回「当日配额用尽」(429 + code=quota_daily) 时必须**立刻放弃**，不得退避重试。
+//
+// 价值：429 有两种语义 —— 限流（重试有用）与配额用尽（当天重试完全无用）。
+// 若不区分，客户端会对每个分块白等 6 轮指数退避（一次上传能拖到分钟级），
+// 既拖慢调用方，也把配额问题伪装成"网络抖动"。
+func TestQuotaDailyIsNotRetried(t *testing.T) {
+	c, primary, backup := setupClient(t, "cn")
+	primary.mu.Lock()
+	primary.quotaInit = 5 // 就算还有额度，也只允许发生 1 次
+	primary.mu.Unlock()
+	backup.mu.Lock()
+	backup.quotaInit = 5
+	backup.mu.Unlock()
+
+	p := writeTemp(t, "quota.bin", SingleShotRawMax+1000) // 走分块 ⇒ 必经 init
+	start := time.Now()
+	_, err := c.Upload(context.Background(), p, "quota.bin")
+	if err == nil {
+		t.Fatal("配额用尽时应报错")
+	}
+	if !strings.Contains(err.Error(), "429") || !strings.Contains(err.Error(), "额度已用尽") {
+		t.Fatalf("错误文案应说明配额问题，实际: %v", err)
+	}
+	if d := time.Since(start); d > 5*time.Second {
+		t.Fatalf("配额用尽不应退避重试（耗时 %v）", d)
+	}
+	primary.mu.Lock()
+	defer primary.mu.Unlock()
+	if primary.initHits != 1 {
+		t.Fatalf("对同一站点应只尝试 1 次 init（不重试），实际 %d 次", primary.initHits)
+	}
 }

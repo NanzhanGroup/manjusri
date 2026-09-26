@@ -68,6 +68,9 @@ const (
 	defaultChunkSize = 512 << 10
 
 	tokenHeader = "X-WS-Files-Token"
+
+	// codeQuotaDaily 服务端机器可读失败码：当日配额用尽（重试无意义）
+	codeQuotaDaily = "quota_daily"
 )
 
 // ErrDisabled 文件服务不可用：既没有节点身份（私钥不可读），也没有令牌
@@ -329,7 +332,7 @@ func (c *Client) deleteAt(ctx context.Context, base, id string) (bool, error) {
 	_ = json.Unmarshal(raw, &r)
 	if resp.StatusCode/100 != 2 || !r.OK {
 		return false, fmt.Errorf("HTTP %d: %s", resp.StatusCode,
-			authErrHint(resp.StatusCode, firstNonEmpty(r.Error, strings.TrimSpace(string(raw)))))
+			authErrHint(resp.StatusCode, r.Code, firstNonEmpty(r.Error, strings.TrimSpace(string(raw)))))
 	}
 	return r.Deleted, nil
 }
@@ -374,7 +377,7 @@ func (c *Client) uploadSingle(ctx context.Context, base, path, name string) (*Re
 	_ = json.Unmarshal(raw, &r)
 	if resp.StatusCode/100 != 2 || !r.OK {
 		return nil, fmt.Errorf("单发上传失败 HTTP %d: %s", resp.StatusCode,
-			authErrHint(resp.StatusCode, firstNonEmpty(r.Error, strings.TrimSpace(string(raw)))))
+			authErrHint(resp.StatusCode, r.Code, firstNonEmpty(r.Error, strings.TrimSpace(string(raw)))))
 	}
 	return r.toResult(false)
 }
@@ -472,18 +475,20 @@ func (c *Client) abort(ctx context.Context, base, uploadID string) {
 // ---------- HTTP 基础 ----------
 
 type apiResp struct {
-	OK        bool   `json:"ok"`
-	Error     string `json:"error"`
-	URL       string `json:"url"`
-	ID        string `json:"id"`
-	Name      string `json:"name"`
-	Size      int64  `json:"size"`
-	SHA256    string `json:"sha256"`
-	ExpiresAt int64  `json:"expires_at"`
-	UploadID  string `json:"upload_id"`
-	ChunkSize int64  `json:"chunk_size"`
-	Chunks    int    `json:"chunks"`
-	Deleted   bool   `json:"deleted"`
+	OK         bool   `json:"ok"`
+	Error      string `json:"error"`
+	URL        string `json:"url"`
+	ID         string `json:"id"`
+	Name       string `json:"name"`
+	Size       int64  `json:"size"`
+	SHA256     string `json:"sha256"`
+	ExpiresAt  int64  `json:"expires_at"`
+	UploadID   string `json:"upload_id"`
+	ChunkSize  int64  `json:"chunk_size"`
+	Chunks     int    `json:"chunks"`
+	Deleted    bool   `json:"deleted"`
+	Code       string `json:"code"` // 机器可读的失败码（如 quota_daily）
+	RetryAfter int    `json:"retry_after"`
 }
 
 func (r apiResp) toResult(chunked bool) (*Result, error) {
@@ -535,7 +540,11 @@ func (c *Client) postJSON(ctx context.Context, url string, payload any, out *api
 			return nil
 		}
 		lastErr = fmt.Errorf("HTTP %d: %s", resp.StatusCode,
-			authErrHint(resp.StatusCode, firstNonEmpty(r.Error, strings.TrimSpace(string(raw)))))
+			authErrHint(resp.StatusCode, r.Code, firstNonEmpty(r.Error, strings.TrimSpace(string(raw)))))
+		// 配额用尽（quota_daily）：当天重试**完全无用** —— 直接放弃，别白等 6 轮指数退避
+		if r.Code == codeQuotaDaily {
+			break
+		}
 		// 429（限流）与 5xx 可重试；4xx 其余（鉴权/参数/超限）重试无意义
 		if resp.StatusCode != http.StatusTooManyRequests && resp.StatusCode/100 != 5 {
 			break
@@ -550,13 +559,16 @@ func (c *Client) postJSON(ctx context.Context, url string, payload any, out *api
 // 401 的常见来源（按概率排序）：① 本机私钥与服务端登记的公钥不一致（换过机器/身份）；
 // ② 本节点既不在名册、也没带有效证书；③ 证书过期/被吊销；④ 节点未授权该操作（scope）。
 // 服务端会回具体原因，这里只补"下一步该做什么"。
-func authErrHint(status int, msg string) string {
-	switch status {
-	case http.StatusUnauthorized:
+func authErrHint(status int, code, msg string) string {
+	switch {
+	case status == http.StatusUnauthorized:
 		return msg + "（节点鉴权未通过：请确认本机 $WS_PATH/data/family/id_ed25519 与官方登记一致；" +
 			"新节点需加入名册或领取官方证书 node-cert.json；证书过期请联系管理员换发）"
-	case http.StatusTooManyRequests:
-		return msg + "（请求被限流：本节点配额或站点限流。接口幂等，稍后重试即可）"
+	case code == codeQuotaDaily:
+		// 服务端文案已说明"重试无效"，**不要再补"稍后重试即可"** —— 自相矛盾会把排障带偏
+		return msg
+	case status == http.StatusTooManyRequests:
+		return msg + "（请求被限流：限流窗口很短，退避重试通常有效）"
 	}
 	return msg
 }
