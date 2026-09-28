@@ -30,3 +30,12 @@ import "github.com/NanzhanGroup/manjusri"
 - `memorysvc/client.go` — 记忆服务客户端（Unix socket HTTP）
 - `memorysvc/thread.go` — 线程管理（话题边界检测、自动切换）
 - `memorysvc/types.go` — 数据类型定义
+
+## 变更记录
+
+- **2026-09-28**：子包 `wsfiles`（节点身份 / 节点签名 wsauth v1 / 文件上传 / 交付模式 / 领证信封）
+  已**迁出本仓**。原因：本仓为公开仓，客户端协议与信任模型不宜公开分发。
+  - 规范源：私有仓 `ws-files` 的 `wsfiles/` 目录（与协议服务端同仓）
+  - 分发方式：内联副本 → 6 个网关的 `internal/wsfiles/`、`ws-tools` 的 `internal/wsfiles/`
+  - 同步脚本：`scripts/wsfiles-client-sync.sh`（改协议请改源，再同步）
+  - 本仓现仅含 `memorysvc`、`token_cache` 两个子包
