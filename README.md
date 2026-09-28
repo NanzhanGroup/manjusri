@@ -1,41 +1,42 @@
-# manjusri — 文殊通用库
+# manjusri — 文殊通用库（已退役 · 历史留档）
 
-**文殊系统的基础库包**，提供 `memorysvc`（记忆服务客户端/服务端）等子包。不是独立二进制，被其他组件 import 使用。
+> ## ⚠️ 本仓已不再被任何组件依赖
+>
+> **状态：退役（deprecated · 历史留档）—— 确认无误后可归档 / 删除。**
+>
+> - 标记日期：**2026-09-29**
+> - 判定依据：全 `/data/code` 内
+>   `grep -rn "NanzhanGroup/manjusri" --include=*.go --include=go.mod` → **0 处编译依赖**
+>   （原先仅剩的 1 处 `device-gateway/server/session.go` 历史注释，同批已改写）。
+> - 原因：本仓全部子包已迁出（见下表）；且本仓为**公开仓**，其中协议 / 信任模型不宜公开分发。
+> - **删除前请确认**：下表「现归属」各新址均可正常构建，且各自同步脚本 `--check` 通过。
 
-## 编译
+## 子包去向（迁出记录）
 
-此项目是 library 包，不产生独立二进制。被以下项目 import：
+| 原子包 | 现归属（规范源） | 分发 / 说明 | 日期 |
+|---|---|---|---|
+| `wsfiles` — 节点身份 / wsauth v1 签名 / 上传 / 交付模式 / 领证信封 | 私有仓 **`ws-files`** 的 `wsfiles/` | 内联副本 → 6 网关 + ws-tools 的 `internal/wsfiles/`；脚本 `ws-files/scripts/wsfiles-client-sync.sh` | 2026-09-28 |
+| `memorysvc` **客户端** | 私有仓 **`memory-service`** 的 `goclient/` | 内联副本 → 5 网关 + api-server + chat 的 `internal/memorysvc/`；脚本 `memory-service/scripts/memsvc-client-sync.sh` | 2026-09-29 |
+| `memorysvc` **服务端** | 私有仓 **`memory-service`**（已 **PuXian 化**：`main.px` / `srv.px` / `mem.px` …，`pxc build main.px`） | 运行中服务（`/data/app/ws/core/memory-service/`）；本仓 Go 版服务端为遗留实现 | 2026-09-29 |
+| `token_cache` — Config / EmbeddingEngine / CosineSimilarity | 私有仓 **`token-cache`** 的 `sharing/` | 内联副本 → chat 的 `internal/token_cache/`；脚本 `token-cache/scripts/tokencache-client-sync.sh` | 2026-09-29 |
 
-```go
-import "github.com/NanzhanGroup/manjusri"
+## 为什么退役
+
+1. **公开暴露**：本仓为公开仓（GitHub API 200）。`wsfiles` 含节点认证协议（`X-WS-Auth/Node/Ts/Nonce/Sig/Cert` + wsauth v1）、文件服务拓扑（`cn.dl` / `hk.dl`）、领证信任流程；`memorysvc` 含内部 Unix socket RPC 契约 —— 均不宜公开。
+2. **包粒度拖累**：Go 的包粒度 = 文件粒度。`memorysvc` 包里 `server.go` 带 `_ "modernc.org/sqlite"`，于是**只需要客户端的网关**被迫把整套 SQLite 引擎编进自己的二进制（实测 **~3.5 MiB / 个**、7 个传递依赖模块，线上 4379 个 sqlite 符号却一次不用）。
+3. **PuXian（普贤）化前置**：迁出后各网关 / 服务端除第三方 SDK 外**零跨仓 Go 依赖**，退化为「协议 + 自包含代码」，可逐文件 `.px` 重写。
+
+## 本仓内容（留档）
+
+```
+memorysvc/     # 遗留 Go 版记忆服务（客户端 + 服务端）—— 已被 memory-service 取代
+token_cache/   # 遗留共享类型 —— 已迁至 token-cache/sharing/
+go.mod go.sum
 ```
 
-## 依赖方
-
-| 项目               | 用途                           |
-|--------------------|--------------------------------|
-| `chat`             | 使用 memorysvc 子包            |
-| `weixin-gateway`   | 使用 memorysvc 客户端          |
-
-## 子包说明
-
-| 子包         | 说明                                               |
-|--------------|----------------------------------------------------|
-| `memorysvc`  | 记忆服务客户端 + 服务端（通过 Unix socket RPC）    |
-| `token_cache`| token-cache 配置类型定义（被 chat/config 引用）     |
-
-## 文件结构
-
-- `memorysvc/server.go` — 记忆服务端实现（独立进程）
-- `memorysvc/client.go` — 记忆服务客户端（Unix socket HTTP）
-- `memorysvc/thread.go` — 线程管理（话题边界检测、自动切换）
-- `memorysvc/types.go` — 数据类型定义
+> **不再维护**：请勿在本仓提交新代码；协议 / 类型改动一律去上表的**规范源**。
 
 ## 变更记录
 
-- **2026-09-28**：子包 `wsfiles`（节点身份 / 节点签名 wsauth v1 / 文件上传 / 交付模式 / 领证信封）
-  已**迁出本仓**。原因：本仓为公开仓，客户端协议与信任模型不宜公开分发。
-  - 规范源：私有仓 `ws-files` 的 `wsfiles/` 目录（与协议服务端同仓）
-  - 分发方式：内联副本 → 6 个网关的 `internal/wsfiles/`、`ws-tools` 的 `internal/wsfiles/`
-  - 同步脚本：`scripts/wsfiles-client-sync.sh`（改协议请改源，再同步）
-  - 本仓现仅含 `memorysvc`、`token_cache` 两个子包
+- **2026-09-29**：`memorysvc` 客户端 → `memory-service/goclient`；`token_cache` → `token-cache/sharing`；服务端由 `memory-service` PuXian 版承接。**本仓自此无任何依赖方，进入退役状态。**
+- **2026-09-28**：`wsfiles` 迁出至私有仓 `ws-files`（提交 `d4c6d2f`），本仓仅余 `memorysvc` / `token_cache`。
